@@ -382,6 +382,201 @@ This is exactly what HPL-MxP (HPL-AI) does. It's a legitimate technique used in 
 
 ---
 
+## Level 6: Faster — `ap_fixed` + Template Parameters + Power-of-2 Everything
+
+Applying the low-latency principles from `low_latency_principles_for_hpc.md` directly to HLS:
+
+### Why this is faster than Level 4
+
+| Change | Principle | Speedup Mechanism |
+|---|---|---|
+| `ap_fixed` instead of `double` | Mechanical sympathy — match hardware | 1 DSP per MAC (not 3–4) → 4× more PEs for same resource |
+| `constexpr` tile sizes | Pay at compile time, not runtime | HLS unrolls loops fully, eliminates all bounds checks |
+| Power-of-2 tile sizes | Bitwise ops are free, modulo is not | `& (TILE-1)` replaces `% TILE` — saves cycles in address calc |
+| Accumulator as local variable | Keep hot data in registers | Stays in flip-flop, not BRAM — 0-cycle access |
+| No sync in hot path | Don't synchronise inside timing region | DATAFLOW between stages, never stall the compute pipeline |
+
+```cpp
+#include "ap_fixed.h"
+#include "hls_stream.h"
+
+// Fixed-point type: 32 bits total, 16 integer bits
+// 1 DSP per MAC (vs 3-4 for FP64) = 4× more PEs available
+typedef ap_fixed<32, 16> fixed_t;
+
+// Template parameters → compiler resolves all sizes at elaboration time
+// HLS can fully unroll every loop — no runtime bounds checks
+template<int SA_SIZE, int TILE_K>
+void pe_fast(
+    hls::stream<fixed_t> &a_in, hls::stream<fixed_t> &a_out,
+    hls::stream<fixed_t> &b_in, hls::stream<fixed_t> &b_out,
+    fixed_t &c_out
+) {
+    #pragma HLS INLINE off
+    fixed_t acc = 0;
+
+    // TILE_K + SA_SIZE - 1 is known at compile time → fully unrolled
+    for (int k = 0; k < TILE_K + SA_SIZE - 1; k++) {
+        #pragma HLS PIPELINE II=1
+        fixed_t a = a_in.read();
+        fixed_t b = b_in.read();
+        acc += a * b;    // ap_fixed: 1 DSP48E2, not 3–4
+        a_out.write(a);
+        b_out.write(b);
+    }
+    c_out = acc;
+}
+
+// Skew feeder — power-of-2 TILE_K allows bitwise masking
+template<int SA_SIZE, int TILE_K>
+void skew_a_fast(fixed_t A[SA_SIZE][TILE_K],
+                 hls::stream<fixed_t> a_feed[SA_SIZE]) {
+    static_assert((TILE_K & (TILE_K - 1)) == 0,
+                  "TILE_K must be power of 2 for bitwise masking");
+
+    for (int t = 0; t < TILE_K + SA_SIZE - 1; t++) {
+        #pragma HLS PIPELINE II=1
+        for (int i = 0; i < SA_SIZE; i++) {
+            #pragma HLS UNROLL
+            int k = t - i;
+            // Bitwise AND instead of bounds check — 1 cycle, not a branch
+            bool valid = (k >= 0) & (k < TILE_K);
+            a_feed[i].write(valid ? A[i][k] : fixed_t(0));
+        }
+    }
+}
+```
+
+### What `ap_fixed<32,16>` means
+
+```
+ap_fixed<W, I>
+         │   └─ integer bits (range: -2^(I-1) to 2^(I-1)-1)
+         └───── total width in bits
+
+ap_fixed<32, 16>:
+  - 16 integer bits  → range ±32767
+  - 16 fractional bits → precision ~0.000015
+  - 1 DSP48E2 per MAC  (vs 3–4 for FP64)
+  - Use iterative refinement (see Level 5) to recover accuracy if needed
+```
+
+### Resource comparison: FP64 vs ap_fixed
+
+| Precision | DSPs per MAC | Max PEs on KV260 (1248 DSPs) | Est. GFLOPS @200 MHz |
+|---|---|---|---|
+| FP64 (double) | 3–4 | ~64 (conservative) | ~25.6 |
+| FP32 (float) | 1–2 | ~128 | ~51.2 |
+| ap_fixed<32,16> | 1 | ~200 | ~80 |
+| ap_fixed<16,8> | 0.5 (2 per DSP) | ~400 | ~160 |
+
+### Lesson
+
+> **Rule 6: Match your arithmetic type to your DSP budget.**
+> FP64 is honest but expensive. ap_fixed gives more PEs for the same silicon.
+> Use iterative refinement (Level 5) to recover accuracy after computing in fixed-point.
+
+---
+
+## Low-Latency Principles Applied to HLS
+
+*From `low_latency_principles_for_hpc.md` — translated from CUDA to Vitis HLS.*
+
+### 1. Accumulator in register, not BRAM
+
+```cpp
+// WRONG — forces accumulator into BRAM (array = BRAM in HLS)
+double localC[TILE][TILE];           // HLS maps this to BRAM: ~1-2 cycle access
+for (int k ...) localC[i][j] += ...; // every iteration hits BRAM
+
+// CORRECT — scalar accumulator stays in a flip-flop register
+double acc = 0.0;                    // HLS keeps this in a register: 0-cycle
+for (int k ...) acc += A[i][k] * B[k][j];
+localC[i][j] = acc;                  // ONE write to BRAM at the end
+```
+
+This is the HLS equivalent of the CUDA principle: *"accumulator in register, not shared memory."*
+
+### 2. Never use modulo on the critical path — use power-of-2 tile sizes
+
+```cpp
+// SLOW — integer division inside pipelined loop
+int bank = addr % TILE;    // synthesises to a divider circuit: ~20+ cycles
+
+// FAST — bitwise AND, only valid when TILE is power of 2
+int bank = addr & (TILE - 1);   // 1 LUT, 0 extra latency
+```
+
+Consequence: **always set TILE = 8, 16, 32, 64.** Never 12, 20, etc.
+The HLS tool cannot optimise integer division away — it will literally instantiate a divider.
+
+### 3. Don't stall the pipeline — keep II=1
+
+In HLS, `II` (Initiation Interval) is the FPGA equivalent of `cudaDeviceSynchronize()` inside a loop.
+If the inner loop achieves II=2 instead of II=1, your throughput halves.
+
+```cpp
+// Common II > 1 cause: read-after-write dependency on an array
+double localC[8][8];
+for (int k = 0; k < 8; k++) {
+    #pragma HLS PIPELINE II=1
+    localC[i][j] += val;   // READ localC[i][j] → compute → WRITE localC[i][j]
+                           // HLS sees: write latency > 1 cycle → II=2 or more
+}
+
+// Fix: use scalar accumulator (breaks the BRAM read-write dependency)
+double acc = 0.0;
+for (int k = 0; k < 8; k++) {
+    #pragma HLS PIPELINE II=1
+    acc += val;            // register → register: no memory dependency → II=1
+}
+localC[i][j] = acc;
+```
+
+### 4. Profile before optimising — read the synthesis report
+
+After C-synthesis in Vitis HLS, check the report for:
+
+```
+Timing:
+  Estimated clock period: X ns  ← must be < your target (e.g., 5 ns for 200 MHz)
+
+Latency:
+  Loop 'COMPUTE': II=? Latency=?  ← II=1 is your goal
+
+Utilisation:
+  DSP:   X / 1248  ← headroom for more PEs?
+  BRAM:  X / 144   ← are tiles fitting on-chip?
+  FF:    X / 234K
+  LUT:   X / 117K
+```
+
+If II > 1 on the compute loop, the report shows the **dependency** causing it.
+Fix that dependency before adding more PEs — more PEs on a slow pipeline just wastes DSPs.
+
+### 5. Shift the bottleneck — compute-bound, not memory-bound
+
+Same roofline principle as CUDA:
+
+```
+Memory-bound (bad):  compute finishes, waiting for next DDR tile
+Compute-bound (good): next DDR tile arrives, waiting for compute to finish
+
+Target: compute_time ≥ load_time
+
+Compute time = (Tm × Tn × Tk) / (num_PEs × freq)
+Load time    = (Tm × Tk + Tk × Tn) × bytes_per_element / DDR_bandwidth
+
+If compute_time < load_time → add more PEs (or increase Tk)
+If compute_time > load_time → widen the DDR bus (or use DATAFLOW to overlap)
+```
+
+For KV260 DDR bandwidth ~17 GB/s and 64 FP64 PEs at 200 MHz:
+- Load time for 16×16 tile = (256 + 256) × 8 / 17e9 ≈ 240 ns
+- Compute time = 256 × 256 MACs / (64 × 200M) ≈ 5 µs → **compute-bound** ✅
+
+---
+
 ## Optimisation Summary Table
 
 | Level | Technique | Key Pragma | Speedup vs Previous | Bottleneck Addressed |
@@ -392,8 +587,9 @@ This is exactly what HPL-MxP (HPL-AI) does. It's a legitimate technique used in 
 | 3 | Dataflow | `DATAFLOW` | ~2–3× | Load/compute serialisation |
 | 4 | Systolic array | `hls::stream`, PE grid | ~4–8× | BRAM port contention |
 | 5 | Production tricks | Wide ports, multi-tile, mixed precision | ~2× | Memory bandwidth |
+| 6 | `ap_fixed` + templates + power-of-2 | `ap_fixed<W,I>`, `template<int>` | ~2–4× | DSP efficiency, II stalls, modulo overhead |
 
-### Cumulative: Level 0 → Level 5 ≈ **5,000–10,000×** improvement
+### Cumulative: Level 0 → Level 6 ≈ **20,000–60,000×** improvement
 
 ---
 

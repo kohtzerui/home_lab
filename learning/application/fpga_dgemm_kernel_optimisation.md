@@ -514,7 +514,7 @@ void systolic_dgemm(
     FEED_A: for (int i = 0; i < SA_SIZE; i++)
         for (int k = 0; k < TILE_K + SA_SIZE - 1; k++) {
             #pragma HLS PIPELINE II=1
-            a_pipe[i][0].write(a_feed[i].read());
+            a_pipe[i][0].write(a_feed[i].read()); 
         }
     FEED_B: for (int j = 0; j < SA_SIZE; j++)
         for (int k = 0; k < TILE_K + SA_SIZE - 1; k++) {
@@ -543,34 +543,56 @@ void systolic_dgemm(
 }
 ```
 
-### What `ap_fixed<32,16>` means
+### ⚠️ Critical Correction: `ap_fixed<32,16>` does NOT map to 1 DSP48E2
+
+This was a **factual error** in the Level 6 design, caught by deep research.
 
 ```
-ap_fixed<W, I>
-         │   └─ integer bits (range: -2^(I-1) to 2^(I-1)-1)
-         └───── total width in bits
+DSP48E2 physical ports (UltraScale+, used on KV260):
+  Multiplier A-port: 27 bits maximum
+  Multiplier B-port: 18 bits maximum
+  Accumulator P-reg: 48 bits
 
-ap_fixed<32, 16>:
-  - 16 integer bits  → range ±32767
-  - 16 fractional bits → precision ~0.000015
-  - 1 DSP48E2 per MAC  (vs 3–4 for FP64)
-  - Use iterative refinement (see Level 5) to recover accuracy if needed
+ap_fixed<32, 16> multiplication:
+  32 bits > 27-bit A-port  ← EXCEEDS HARDWARE LIMIT
+
+What HLS actually does:
+  Option A: Cascade 2 DSPs (splits 32-bit into partial products) → 2× resource cost
+  Option B: Use 1 DSP + LUT fabric for upper bits → routing delay, timing failure at high freq
+
+Correct types for exactly 1 DSP48E2 per MAC:
+  Symmetric:   ap_fixed<18, 9>  × ap_fixed<18, 9>   (fits both ports)
+  Asymmetric:  ap_fixed<27, 13> × ap_fixed<18, 9>   (max precision, 1 DSP)
+  High density: ap_fixed<16, 8> × ap_fixed<16, 8>   (fits easily, allows 2 MACs per DSP)
+
+Note: AP_SAT (saturation) ALSO breaks DSP inference — use AP_WRAP only.
+Saturation requires fabric comparators that break the internal DSP feedback loop.
 ```
 
-### Resource comparison: FP64 vs ap_fixed
+### Corrected resource table: DSP48E2 (KV260)
 
-| Precision | DSPs per MAC | Max PEs on KV260 (1248 DSPs) | Est. GFLOPS @200 MHz |
-|---|---|---|---|
-| FP64 (double) | 3–4 | ~64 (conservative) | ~25.6 |
-| FP32 (float) | 1–2 | ~128 | ~51.2 |
-| ap_fixed<32,16> | 1 | ~200 | ~80 |
-| ap_fixed<16,8> | 0.5 (2 per DSP) | ~400 | ~160 |
+| Precision | Fits DSP48E2 ports? | DSPs per MAC | Max PEs (1248 DSPs) | Est. GFLOPS @200 MHz |
+|---|---|---|---|---|
+| FP64 (double) | ❌ (uses FPGA FP cores) | 3–4 | ~64 | ~25.6 |
+| FP32 (float) | ❌ | 1–2 | ~128 | ~51.2 |
+| `ap_fixed<32,16>` | ❌ **exceeds 27-bit A-port** | **2 (cascaded)** | ~100 | ~40 |
+| `ap_fixed<27,13>×ap_fixed<18,9>` | ✅ asymmetric | **1** | ~200 | ~80 |
+| `ap_fixed<16,8>` | ✅ fits easily | **1** (or 2/DSP) | ~200–400 | ~80–160 |
 
-### Lesson
+### DSP architecture limits by Xilinx family
 
-> **Rule 6: Match your arithmetic type to your DSP budget.**
-> FP64 is honest but expensive. ap_fixed gives more PEs for the same silicon.
-> Use iterative refinement (Level 5) to recover accuracy after computing in fixed-point.
+| Family | DSP Type | A-port | B-port | Accumulator |
+|---|---|---|---|---|
+| 7 Series (Zynq-7000) | DSP48E1 | 25 bits | 18 bits | 48 bits |
+| UltraScale+ (KV260) | DSP48E2 | **27 bits** | **18 bits** | 48 bits |
+| Versal | DSP58 | 34 bits | 24 bits | 58 bits |
+
+### Lesson (corrected)
+
+> **Rule 6: Match your arithmetic type to the PHYSICAL DSP PORT LIMITS.**
+> `ap_fixed<32,16>` on a KV260 cascades two DSPs — halving your PE count.
+> Use `ap_fixed<27,13>` × `ap_fixed<18,9>` for maximum density at 1 DSP/MAC.
+> Never use `AP_SAT` on the accumulator — it breaks the DSP's internal P-register loop.
 
 ---
 
@@ -673,6 +695,317 @@ For KV260 DDR bandwidth ~17 GB/s and 64 FP64 PEs at 200 MHz:
 
 ---
 
+## Level 7: Production-Grade — DSP Intrinsics + `hls::task` + SRL Skewing
+
+*Based on AMD Vitis HLS UG1399, SPCL research, and deep microarchitectural analysis.*
+
+Level 6 fixed the fundamentals. Level 7 changes the **execution model** to match how FPGA hardware actually works.
+
+---
+
+### 7.1 Correct DSP Mapping: Asymmetric Types + `BIND_OP`
+
+Fix the precision first. Then optionally use DSP intrinsics for guaranteed mapping.
+
+```cpp
+// Correct asymmetric types for exactly 1 DSP48E2 per MAC
+// A-port: 27 bits max, B-port: 18 bits max
+typedef ap_fixed<27, 13> weight_t;    // A-port: weights (higher precision)
+typedef ap_fixed<18,  9> act_t;       // B-port: activations
+typedef ap_fixed<48, 22> acc_t;       // maps to DSP's 48-bit P accumulator
+
+// --- Option A: Use BIND_OP (simpler, compiler-assisted) ---
+template<int SA_SIZE, int TILE_K>
+void pe_correct(
+    hls::stream<weight_t> &a_in, hls::stream<weight_t> &a_out,
+    hls::stream<act_t>    &b_in, hls::stream<act_t>    &b_out,
+    hls::stream<acc_t>    &c_out
+) {
+    #pragma HLS INLINE off
+    acc_t acc = 0;
+    // Bind the accumulation to DSP with explicit latency
+    // Must match so PIPELINE II=1 can be met
+    #pragma HLS BIND_OP variable=acc op=add impl=dsp
+
+    PE_LOOP: for (int k = 0; k < TILE_K + SA_SIZE - 1; k++) {
+        #pragma HLS PIPELINE II=1
+        weight_t a = a_in.read();
+        act_t    b = b_in.read();
+        // 27-bit × 18-bit → fits DSP48E2 exactly → 1 DSP, P-register accumulates
+        acc += (acc_t)(a * b);
+        a_out.write(a);
+        b_out.write(b);
+    }
+    c_out.write(acc);
+}
+```
+
+```cpp
+// --- Option B: DSP intrinsic (guaranteed mapping, bypasses compiler heuristics) ---
+#include "hls_dsp_builtins.h"
+using namespace hls::dsp48e2;
+
+typedef ap_int<27> A_t;   // raw int for intrinsic (no ap_fixed wrapping)
+typedef ap_int<18> B_t;
+typedef ap_int<48> P_t;   // P-register output
+
+void pe_intrinsic(
+    hls::stream<A_t> &a_in, hls::stream<A_t> &a_out,
+    hls::stream<B_t> &b_in, hls::stream<B_t> &b_out,
+    hls::stream<P_t> &c_out
+) {
+    #pragma HLS INLINE off
+    P_t acc = 0;
+
+    PE_LOOP: for (int k = 0; k < TILE_K + SA_SIZE - 1; k++) {
+        #pragma HLS PIPELINE II=1
+        A_t a = a_in.read();
+        B_t b = b_in.read();
+        // Structural instantiation of DSP48E2 — no compiler guessing
+        // P = A * B + P  (uses internal DSP feedback, not fabric routing)
+        acc = mul_add<REG_A1 | REG_P>(a, b, acc);
+        a_out.write(a);
+        b_out.write(b);
+    }
+    c_out.write(acc);
+}
+```
+
+**Why `REG_A1 | REG_P` matters:** These flags enable the DSP's internal pipeline registers,
+allowing the feedback path (`P → P + A×B`) to close timing at 300+ MHz without leaving the DSP slice.
+
+---
+
+### 7.2 Replace Arithmetic Skewing with Shift Register Logic (SRL)
+
+Arithmetic masking (Level 6) uses LUTs to *compute* which elements are valid each cycle.
+SRL uses LUTs as *memory* to *delay* elements — no compute, no routing congestion.
+
+```cpp
+// Xilinx SRLs: LUT configured as a shift register
+// SRL16E: 16-deep shift register using 1 LUT
+// SRL32E: 32-deep shift register using 1 LUT
+// Cost: 1 LUT per bit per delay stage — far cheaper than arithmetic masking at scale
+
+template<int DELAY>
+void srl_delay(
+    hls::stream<act_t> &in,
+    hls::stream<act_t> &out
+) {
+    #pragma HLS INLINE off
+    act_t shift_reg[DELAY];
+    // Bind to SRL primitive — not flip-flops, not BRAM
+    #pragma HLS BIND_STORAGE variable=shift_reg impl=srl type=fifo
+
+    SRL_LOOP: for (;;) {
+        #pragma HLS PIPELINE II=1
+        // Shift everything one position
+        act_t in_val = in.read();
+        for (int i = DELAY - 1; i > 0; i--) {
+            #pragma HLS UNROLL
+            shift_reg[i] = shift_reg[i-1];
+        }
+        shift_reg[0] = in_val;
+        out.write(shift_reg[DELAY - 1]);
+    }
+}
+
+// SRL-based skew feeder — row i gets i cycles of delay, zero arithmetic
+template<int SA_SIZE>
+void skew_a_srl(
+    hls::stream<act_t> a_raw[SA_SIZE],    // undelayed rows
+    hls::stream<act_t> a_skewed[SA_SIZE]  // delayed rows
+) {
+    #pragma HLS DATAFLOW
+    for (int i = 0; i < SA_SIZE; i++) {
+        #pragma HLS UNROLL
+        // Row 0: 0 delay, Row 1: 1 delay, Row i: i delays
+        // Uses i LUTs per bit — pure spatial delay, no computation
+        srl_delay<i>(a_raw[i], a_skewed[i]);
+    }
+}
+```
+
+**Comparison:**
+
+| Skew Method | Resources | Timing risk | Scales to 256×256? |
+|---|---|---|---|
+| Arithmetic mask (Level 6) | LUTs for comparators + MUX | Critical path grows with SA_SIZE | ❌ becomes bottleneck |
+| SRL delay (Level 7) | 1 LUT per bit per delay | Zero logic depth | ✅ scales freely |
+
+---
+
+### 7.3 Replace `DATAFLOW` Sequential Loops with `hls::task` (DTLP)
+
+The Level 6 `systolic_dgemm` uses `DATAFLOW` but puts sequential loops (FEED_A, FEED_B)
+inside the dataflow region. This forces the compiler to infer oversized FIFOs to synchronise.
+
+`hls::task` (Data-Driven Task-Level Parallelism) defines tasks that run **continuously and independently**,
+triggering when input data is available — exactly like real hardware.
+
+```cpp
+#include "hls_task.h"
+
+// Each task runs forever — no start/stop handshake
+// Streams are the only interface — perfectly decoupled
+
+void a_skew_task(
+    hls::stream<act_t> &raw_in,
+    hls::stream<act_t> &skewed_out,
+    int delay
+) {
+    // Infinite loop — task never returns, always consuming input
+    act_t shift_reg[16];
+    #pragma HLS BIND_STORAGE variable=shift_reg impl=srl
+
+    while (true) {
+        #pragma HLS PIPELINE II=1
+        act_t val = raw_in.read();
+        for (int i = 15; i > 0; i--) shift_reg[i] = shift_reg[i-1];
+        shift_reg[0] = val;
+        skewed_out.write(shift_reg[delay - 1]);
+    }
+}
+
+// Top-level using hls::task — hardware-native model
+template<int SA_SIZE, int TILE_K>
+void systolic_dgemm_task(
+    hls::stream<act_t> a_input[SA_SIZE],  // DMA feeds these
+    hls::stream<act_t> b_input[SA_SIZE],
+    hls::stream<acc_t> c_output[SA_SIZE][SA_SIZE]
+) {
+    // Thread-local streams: compiler infers lightweight, localised FIFOs
+    hls_thread_local hls::stream<act_t> a_skewed[SA_SIZE];
+    hls_thread_local hls::stream<act_t> b_skewed[SA_SIZE];
+    hls_thread_local hls::stream<act_t> a_pipe[SA_SIZE][SA_SIZE+1];
+    hls_thread_local hls::stream<act_t> b_pipe[SA_SIZE+1][SA_SIZE];
+    #pragma HLS STREAM variable=a_pipe depth=2
+    #pragma HLS STREAM variable=b_pipe depth=2
+
+    // Skew tasks — one per row/column, all run concurrently, always
+    hls_thread_local hls::task a_skew_tasks[SA_SIZE];
+    hls_thread_local hls::task b_skew_tasks[SA_SIZE];
+    for (int i = 0; i < SA_SIZE; i++) {
+        #pragma HLS UNROLL
+        a_skew_tasks[i](a_skew_task, a_input[i], a_skewed[i], i);
+        b_skew_tasks[i](a_skew_task, b_input[i], b_skewed[i], i);
+    }
+
+    // PE grid tasks — SA_SIZE×SA_SIZE autonomous MAC units
+    hls_thread_local hls::task pe_tasks[SA_SIZE][SA_SIZE];
+    for (int i = 0; i < SA_SIZE; i++) {
+        for (int j = 0; j < SA_SIZE; j++) {
+            #pragma HLS UNROLL
+            pe_tasks[i][j](pe_correct<SA_SIZE, TILE_K>,
+                           a_pipe[i][j],   a_pipe[i][j+1],
+                           b_pipe[i][j],   b_pipe[i+1][j],
+                           c_output[i][j]);
+        }
+    }
+
+    // Wire skewed feeds to pipe edges (also task-based)
+    // In real design: edge wiring also becomes hls::task
+}
+```
+
+**What changes with `hls::task` vs `DATAFLOW`:**
+
+| | `DATAFLOW` (Level 6) | `hls::task` (Level 7) |
+|---|---|---|
+| Execution model | Run-to-completion function calls | Continuously running hardware FSMs |
+| FIFO sizing | Compiler guesses (can be huge) | Minimal — just pipeline depth |
+| Sequential loops inside | Violates dataflow semantics | Not possible — tasks are infinite |
+| Latency between tiles | Start/stop overhead per tile | Zero — stream is always flowing |
+| Matches hardware reality | Partially | Exactly |
+
+---
+
+### 7.4 Square Tiling for Minimum Off-Chip Traffic
+
+The research confirms: tile dimensions should be as **square as possible** to maximise data reuse.
+
+```
+Given on-chip memory capacity S (elements):
+  Optimal: Tm ≈ Tn ≈ √S
+
+Why square:
+  A tile of Tm×Tk reads Tm×Tk elements of A and Tk×Tn elements of B
+  to produce Tm×Tn elements of C (which stays on-chip).
+
+  Reuse ratio = (Tm × Tn × Tk MACs) / (Tm×Tk + Tk×Tn) loads
+              = Tm×Tn×Tk / (Tk×(Tm+Tn))
+              = Tm×Tn / (Tm+Tn)
+
+  This is maximised when Tm = Tn (square tiles)
+
+For KV260 with ~144 BRAMs × 36 Kb = ~648 KB on-chip:
+  Reserve ~400 KB for tiles → S ≈ 400K / 2 bytes = 200K elements
+  Optimal tile: √(200K/2) ≈ 316 → use 256×256 (next power-of-2)
+  SA_SIZE = 16, TILE_K = 16 is a reasonable starting point
+```
+
+**Peak throughput formula:**
+
+```
+Performance = 2 × SA_SIZE × SA_SIZE × Frequency
+
+For 16×16 array at 300 MHz:
+  = 2 × 256 × 300M = 153.6 GOPS (int8/fixed)
+  = 2 × 128 × 200M = 51.2 GFLOPS (FP32, 2 DSPs/MAC)
+```
+
+---
+
+### 7.5 `hls::stream_of_blocks` for Array Interfaces in DTLP
+
+Standard scalar streams can't efficiently carry 2D matrix tiles. `stream_of_blocks` provides
+a synchronised multi-dimensional Ping-Pong buffer between memory movers and compute tasks.
+
+```cpp
+#include "hls_streamofblocks.h"
+
+// DMA mover reads a tile from DDR and writes into a block
+void dma_read_task(
+    ap_uint<512>* ddr_ptr,
+    hls::stream_of_blocks<act_t[TILE_M][TILE_K]> &a_tiles
+) {
+    while (true) {
+        hls::write_lock<act_t[TILE_M][TILE_K]> lock(a_tiles);
+        // Fill lock.data[i][j] from DDR burst
+        for (int i = 0; i < TILE_M; i++)
+            for (int j = 0; j < TILE_K; j++) {
+                #pragma HLS PIPELINE II=1
+                lock.data[i][j] = /* burst read from ddr_ptr */;
+            }
+        // lock releases here → block becomes readable by compute task
+    }
+}
+
+// Compute task acquires tile via read_lock (stable view, no pointer aliasing)
+void compute_task(
+    hls::stream_of_blocks<act_t[TILE_M][TILE_K]> &a_tiles,
+    hls::stream<acc_t> &results
+) {
+    while (true) {
+        hls::read_lock<act_t[TILE_M][TILE_K]> lock(a_tiles);
+        // lock.data is stable for the duration of this block
+        // Feed to systolic array...
+    }
+}
+```
+
+**Benefit:** Compiler allocates only 2× tile memory (ping-pong), not SA_SIZE×TILE_K scalar FIFOs.
+
+---
+
+### Level 7 Lesson
+
+> **Rule 7: Design for the hardware execution model, not the software execution model.**
+> `hls::task` produces FSMs that react to data — that is how FPGA logic actually works.
+> `DATAFLOW` with sequential loops is a software approximation of hardware; `hls::task` is hardware.
+
+---
+
 ## Optimisation Summary Table
 
 | Level | Technique | Key Pragma | Speedup vs Previous | Bottleneck Addressed |
@@ -683,9 +1016,10 @@ For KV260 DDR bandwidth ~17 GB/s and 64 FP64 PEs at 200 MHz:
 | 3 | Dataflow | `DATAFLOW` | ~2–3× | Load/compute serialisation |
 | 4 | Systolic array | `hls::stream`, PE grid | ~4–8× | BRAM port contention |
 | 5 | Production tricks | Wide ports, multi-tile, mixed precision | ~2× | Memory bandwidth |
-| 6 | `ap_fixed` + templates + power-of-2 | `ap_fixed<W,I>`, `template<int>` | ~2–4× | DSP efficiency, II stalls, modulo overhead |
+| 6 | `ap_fixed` + templates + power-of-2 *(with correction)* | `ap_fixed<27,13>×ap_fixed<18,9>`, `template<int>` | ~2–4× | DSP port limits, II stalls, modulo overhead |
+| 7 | DSP intrinsics + `hls::task` + SRL skewing | `hls::task`, `BIND_OP impl=dsp`, `BIND_STORAGE impl=srl` | ~2× clock freq improvement | Timing closure, FIFO bloat, skew routing congestion |
 
-### Cumulative: Level 0 → Level 6 ≈ **20,000–60,000×** improvement
+### Cumulative: Level 0 → Level 7 ≈ **50,000–100,000×** improvement
 
 ---
 
@@ -709,5 +1043,11 @@ For comparison: ARM Cortex-A53 on KV260 ≈ **0.5 GFLOPS FP64**. Even a 4×4 arr
 | `learning_kv260_fpga.md` Layer 2.5 | Full systolic array theory with cycle-by-cycle trace |
 | [spcl/gemm_hls](https://github.com/spcl/gemm_hls) | Production HLS systolic GEMM — study the source |
 | [Vitis_Accel_Examples/systolic_array](https://github.com/Xilinx/Vitis_Accel_Examples) | Simplest working systolic example |
-| UG1399 (Vitis HLS User Guide) | The pragma bible — look up any pragma here |
-| SPCL FPGA'20 paper | "Flexible Communication Avoiding Matrix Multiplication on FPGA" |
+| UG1399 — *Tasks and Channels* | `hls::task` and `hls_thread_local` stream model |
+| UG1399 — *Using DSP Intrinsics* | `hls::dsp48e2::mul_add`, guaranteed DSP mapping |
+| UG1399 — *DSP Multi-Operation Matching* | When BIND_OP works and when it fails |
+| UG1399 — *Accumulation* | How the P-register accumulator maps to HLS |
+| UG1399 — *Specifying Arrays as Stream-of-Blocks* | `hls::stream_of_blocks` for tile buffers |
+| UG579 — *UltraScale DSP48E2 User Guide* | Physical port geometry: A=27 bits, B=18 bits |
+| SPCL FPGA’20 paper | "Flexible Communication Avoiding Matrix Multiplication on FPGA" |
+| arxiv: Stream-HLS | Automatic dataflow acceleration using MLIR/polyhedral compilers |

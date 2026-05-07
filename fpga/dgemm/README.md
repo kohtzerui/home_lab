@@ -7,9 +7,10 @@ Vitis HLS kernel implementing an output-stationary systolic array for General Ma
 ```
 fpga/dgemm/
 ├── src/
-│   └── systolic_dgemm_v7.cpp   ← HLS kernel (top-level: systolic_dgemm)
+│   ├── systolic_dgemm_v7.cpp   ← Optimised kernel  (Level 7)
+│   └── dgemm_naive.cpp         ← Naive baseline    (Level 0, double, no pragmas)
 └── tb/
-    └── (testbench — TBD)
+    └── tb_dgemm.cpp            ← Testbench: correctness + benchmark comparison
 ```
 
 ## Architecture
@@ -40,7 +41,57 @@ fpga/dgemm/
 | DSP usage | ~64 / 1248 |
 | BRAM usage | ~6 / 144 |
 
-## Build (Vitis HLS 2022.1+)
+## How to Benchmark
+
+### Step 1 — C-Simulation (verify correctness of both kernels)
+
+```tcl
+open_project dgemm_hls
+add_files src/systolic_dgemm_v7.cpp
+add_files src/dgemm_naive.cpp
+add_files -tb tb/tb_dgemm.cpp
+open_solution sol_v7
+set_part xczu5ev-sfvc784-2-e
+create_clock -period 4 -name default
+csim_design
+```
+
+Expected output:
+```
+PASS: dgemm_naive (err=~0 < tol=1e-9)
+PASS: systolic_v7  (err=<0.01 < tol=0.01)
+```
+
+### Step 2 — C-Synthesis: Optimised kernel
+
+```tcl
+set_top systolic_dgemm
+csynth_design
+# Check: solution/syn/report/systolic_dgemm_csynth.rpt
+#   PE_LOOP II = 1   (target)
+#   DSP    ~64       (target)
+```
+
+### Step 3 — C-Synthesis: Naive baseline
+
+```tcl
+set_top dgemm_naive
+csynth_design
+# Check: solution/syn/report/dgemm_naive_csynth.rpt
+#   INNER_K II = 5+   (expected — no pipeline pragma)
+#   DSP     3-4       (FP64 multiplier)
+```
+
+### Expected benchmark comparison
+
+| Metric | `dgemm_naive` | `systolic_dgemm_v7` | Ratio |
+|---|---|---|---|
+| Loop II | 5–20 | 1 | ~10× |
+| Latency (64×64) | ~1.3M cycles | ~5,900 cycles | ~220× |
+| DSP | 3–4 (sequential) | 64 (parallel) | 16× |
+| Est. GFLOPS | ~0.05 | ~80 | ~1,600× |
+
+## Build for IP Export (optimised kernel only)
 
 ```tcl
 open_project dgemm_hls

@@ -399,51 +399,147 @@ Applying the low-latency principles from `low_latency_principles_for_hpc.md` dir
 ```cpp
 #include "ap_fixed.h"
 #include "hls_stream.h"
+#include "ap_int.h"
 
-// Fixed-point type: 32 bits total, 16 integer bits
-// 1 DSP per MAC (vs 3-4 for FP64) = 4× more PEs available
+// Fixed-point: 32 bits total, 16 integer bits
+// 1 DSP48E2 per MAC — 4× more PEs vs FP64
 typedef ap_fixed<32, 16> fixed_t;
 
-// Template parameters → compiler resolves all sizes at elaboration time
-// HLS can fully unroll every loop — no runtime bounds checks
+// ─────────────────────────────────────────────
+// Processing Element
+// ─────────────────────────────────────────────
 template<int SA_SIZE, int TILE_K>
 void pe_fast(
-    hls::stream<fixed_t> &a_in, hls::stream<fixed_t> &a_out,
-    hls::stream<fixed_t> &b_in, hls::stream<fixed_t> &b_out,
-    fixed_t &c_out
+    hls::stream<fixed_t> &a_in,  hls::stream<fixed_t> &a_out,
+    hls::stream<fixed_t> &b_in,  hls::stream<fixed_t> &b_out,
+    hls::stream<fixed_t> &c_out  // stream output for DATAFLOW compatibility
 ) {
     #pragma HLS INLINE off
     fixed_t acc = 0;
 
-    // TILE_K + SA_SIZE - 1 is known at compile time → fully unrolled
-    for (int k = 0; k < TILE_K + SA_SIZE - 1; k++) {
+    PE_LOOP: for (int k = 0; k < TILE_K + SA_SIZE - 1; k++) {
         #pragma HLS PIPELINE II=1
+        // Tell HLS: no loop-carried dependency on acc across iterations
+        // (the accumulation IS the dependency, but it's correctly pipelined)
+        #pragma HLS DEPENDENCE variable=acc inter false
         fixed_t a = a_in.read();
         fixed_t b = b_in.read();
-        acc += a * b;    // ap_fixed: 1 DSP48E2, not 3–4
-        a_out.write(a);
-        b_out.write(b);
+        acc += a * b;
+        a_out.write(a);   // pass right →
+        b_out.write(b);   // pass down  ↓
     }
-    c_out = acc;
+    c_out.write(acc);     // emit result once — stream keeps DATAFLOW happy
 }
 
-// Skew feeder — power-of-2 TILE_K allows bitwise masking
+// ─────────────────────────────────────────────
+// Skew feeder for A rows
+// FIX 1: no branch inside pipeline — use ap_uint arithmetic mask
+// FIX 2: ap_uint<1> mask costs 0 DSPs (pure LUT logic)
+// ─────────────────────────────────────────────
 template<int SA_SIZE, int TILE_K>
 void skew_a_fast(fixed_t A[SA_SIZE][TILE_K],
                  hls::stream<fixed_t> a_feed[SA_SIZE]) {
+    #pragma HLS ARRAY_PARTITION variable=A complete dim=2  // all cols readable at once
     static_assert((TILE_K & (TILE_K - 1)) == 0,
-                  "TILE_K must be power of 2 for bitwise masking");
+                  "TILE_K must be power of 2");
 
-    for (int t = 0; t < TILE_K + SA_SIZE - 1; t++) {
+    SKEW_A: for (int t = 0; t < TILE_K + SA_SIZE - 1; t++) {
         #pragma HLS PIPELINE II=1
         for (int i = 0; i < SA_SIZE; i++) {
             #pragma HLS UNROLL
             int k = t - i;
-            // Bitwise AND instead of bounds check — 1 cycle, not a branch
-            bool valid = (k >= 0) & (k < TILE_K);
-            a_feed[i].write(valid ? A[i][k] : fixed_t(0));
+            // Branchless: ap_uint<1> mask — 0 or 1, no if/else synthesised
+            ap_uint<1> valid = (ap_uint<8>(k) < ap_uint<8>(TILE_K)) &
+                               (t >= i ? ap_uint<1>(1) : ap_uint<1>(0));
+            // Arithmetic select: no conditional, synthesises to LUT MUX
+            fixed_t val = valid ? A[i][k & (TILE_K - 1)] : fixed_t(0);
+            a_feed[i].write(val);
         }
     }
+}
+
+// ─────────────────────────────────────────────
+// Skew feeder for B columns  (was MISSING in Level 5/6)
+// ─────────────────────────────────────────────
+template<int SA_SIZE, int TILE_K>
+void skew_b_fast(fixed_t B[TILE_K][SA_SIZE],
+                 hls::stream<fixed_t> b_feed[SA_SIZE]) {
+    #pragma HLS ARRAY_PARTITION variable=B complete dim=2  // all cols readable at once
+    static_assert((TILE_K & (TILE_K - 1)) == 0,
+                  "TILE_K must be power of 2");
+
+    SKEW_B: for (int t = 0; t < TILE_K + SA_SIZE - 1; t++) {
+        #pragma HLS PIPELINE II=1
+        for (int j = 0; j < SA_SIZE; j++) {
+            #pragma HLS UNROLL
+            int k = t - j;
+            ap_uint<1> valid = (ap_uint<8>(k) < ap_uint<8>(TILE_K)) &
+                               (t >= j ? ap_uint<1>(1) : ap_uint<1>(0));
+            fixed_t val = valid ? B[k & (TILE_K - 1)][j] : fixed_t(0);
+            b_feed[j].write(val);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────
+// Top-level: SA_SIZE × SA_SIZE systolic array
+// DATAFLOW overlaps: skew_a | skew_b | all PEs in parallel
+// ─────────────────────────────────────────────
+template<int SA_SIZE, int TILE_K>
+void systolic_dgemm(
+    fixed_t A[SA_SIZE][TILE_K],   // tile of A (on-chip)
+    fixed_t B[TILE_K][SA_SIZE],   // tile of B (on-chip)
+    fixed_t C[SA_SIZE][SA_SIZE]   // output tile
+) {
+    #pragma HLS DATAFLOW  // skew feeders + all PEs run concurrently
+
+    // Inter-PE streams — A flows right, B flows down
+    hls::stream<fixed_t> a_pipe[SA_SIZE][SA_SIZE + 1];
+    hls::stream<fixed_t> b_pipe[SA_SIZE + 1][SA_SIZE];
+    hls::stream<fixed_t> c_pipe[SA_SIZE][SA_SIZE];    // PE → result
+    #pragma HLS STREAM variable=a_pipe depth=2
+    #pragma HLS STREAM variable=b_pipe depth=2
+    #pragma HLS STREAM variable=c_pipe depth=1
+
+    // Input feeds (skewed)
+    hls::stream<fixed_t> a_feed[SA_SIZE];
+    hls::stream<fixed_t> b_feed[SA_SIZE];
+    #pragma HLS STREAM variable=a_feed depth=TILE_K+SA_SIZE
+    #pragma HLS STREAM variable=b_feed depth=TILE_K+SA_SIZE
+
+    skew_a_fast<SA_SIZE, TILE_K>(A, a_feed);
+    skew_b_fast<SA_SIZE, TILE_K>(B, b_feed);
+
+    // Wire feeds into left/top edges
+    FEED_A: for (int i = 0; i < SA_SIZE; i++)
+        for (int k = 0; k < TILE_K + SA_SIZE - 1; k++) {
+            #pragma HLS PIPELINE II=1
+            a_pipe[i][0].write(a_feed[i].read());
+        }
+    FEED_B: for (int j = 0; j < SA_SIZE; j++)
+        for (int k = 0; k < TILE_K + SA_SIZE - 1; k++) {
+            #pragma HLS PIPELINE II=1
+            b_pipe[0][j].write(b_feed[j].read());
+        }
+
+    // Instantiate PE grid — UNROLL creates SA_SIZE×SA_SIZE physical PEs
+    PE_ROWS: for (int i = 0; i < SA_SIZE; i++) {
+        PE_COLS: for (int j = 0; j < SA_SIZE; j++) {
+            #pragma HLS UNROLL
+            pe_fast<SA_SIZE, TILE_K>(
+                a_pipe[i][j],    a_pipe[i][j+1],
+                b_pipe[i][j],    b_pipe[i+1][j],
+                c_pipe[i][j]
+            );
+        }
+    }
+
+    // Collect results
+    COLLECT: for (int i = 0; i < SA_SIZE; i++)
+        for (int j = 0; j < SA_SIZE; j++) {
+            #pragma HLS PIPELINE II=1
+            C[i][j] = c_pipe[i][j].read();
+        }
 }
 ```
 

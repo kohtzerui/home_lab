@@ -58,15 +58,17 @@ Front Panel:
 
 ### Your Devices and Their NICs
 
-| Device | NIC Speed | Will connect at | Cable needed |
-|---|---|---|---|
-| Beelink S12 Pro | 1GbE | 1 Gbps on 2.5G port | Cat 5e |
-| KV260 | 1GbE (PS Ethernet) | 1 Gbps on 2.5G port | Cat 5e |
-| Home router (uplink) | Likely 1GbE | 1 Gbps on 2.5G port | Cat 5e |
-| Future RTX 3060 node | Depends on host | Depends | — |
-| Future NAS/workstation | 10GbE (if upgraded) | 10 Gbps on combo port | Cat 6a or SFP+ DAC |
+| Device | NIC Speed | Switch Port | Will connect at | Cable needed |
+|---|---|---|---|---|
+| ONU (fiber modem, 5Gbps ISP) | 5GbE+ out | **Port 9 / C1** (10GbE combo) ✅ | Up to 10 Gbps | Cat 6a |
+| Home Router | 1GbE | Port 1 | 1 Gbps | Cat 5e |
+| KV260 FPGA | 1GbE (PS Ethernet) | Port 3 | 1 Gbps | Cat 5e |
+| Beelink S12 Pro | 1GbE | Port 4 | 1 Gbps | Cat 5e |
+| RTX 3060 (eGPU) | PCIe via ADT-Link | No switch port | Direct to Beelink M.2 | ADT-Link ribbon |
+| Future NAS/workstation | 10GbE (if upgraded) | C2 / Port 10 | 10 Gbps on combo port | Cat 6a or SFP+ DAC |
 
-All your current devices are 1GbE and will work perfectly on the 2.5G RJ45 ports (they auto-negotiate down).
+> [!TIP]
+> ONU is now on **Port 9 (C1)** — the 10GbE combo port. The switch can now pass the full **5Gbps** from your ISP. 5Gbps internet uses XGS-PON technology; the ONU outputs at 10GbE so the combo port is the right connection.
 
 ---
 
@@ -226,22 +228,22 @@ VERDICT: Only enable jumbo frames between cluster nodes.
 Label your ports physically (masking tape + marker) to avoid confusion:
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│ Port │ Device          │ Speed │ VLAN │ MTU  │ Notes    │
-├──────┼─────────────────┼───────┼──────┼──────┼──────────┤
-│  1   │ Home router     │ 1G    │  1   │ 1500 │ Uplink   │
-│  2   │ Beelink S12 Pro │ 1G    │  1   │ 1500*│ Dev PC   │
-│  3   │ KV260 FPGA      │ 1G    │  1   │ 1500*│ FPGA     │
-│  4   │ (future GPU)    │ -     │  1   │ -    │ Reserved │
-│  5   │ (spare)         │ -     │  1   │ -    │          │
-│  6   │ (spare)         │ -     │  1   │ -    │          │
-│  7   │ (spare)         │ -     │  1   │ -    │          │
-│  8   │ (spare)         │ -     │  1   │ -    │          │
-│  C1  │ (future 10G)    │ -     │  1   │ -    │ NAS?     │
-│  C2  │ (spare)         │ -     │  1   │ -    │          │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│ Port │ Device              │ Speed │ VLAN │ MTU  │ Notes          │
+├──────┼─────────────────────┼───────┼──────┼──────┼────────────────┤
+│  1   │ Home Router         │ 1G    │  1   │ 1500 │ DHCP / WiFi    │
+│  2   │ (spare)             │ -     │  1   │ -    │                │
+│  3   │ KV260 FPGA          │ 1G    │  1   │ 1500†│ FPGA node      │
+│  4   │ Beelink S12 Pro     │ 1G    │  1   │ 1500†│ Dev PC + eGPU  │
+│  5   │ (spare)             │ -     │  1   │ -    │                │
+│  6   │ (spare)             │ -     │  1   │ -    │                │
+│  7   │ (spare)             │ -     │  1   │ -    │                │
+│  8   │ (spare)             │ -     │  1   │ -    │                │
+│  C1  │ ONU (fiber modem) ✅│ 10G   │  1   │ 1500 │ Full 5Gbps ISP │
+│  C2  │ (spare)             │ -     │  1   │ -    │ Future NAS     │
+└──────────────────────────────────────────────────────────────────┘
 
-* Change to 9000 later if jumbo frames testing passes
+† Change MTU to 9000 later if jumbo frames testing passes
 ```
 
 ---
@@ -414,39 +416,39 @@ The QSS dashboard shows at a glance:
 ## Network Diagram (Full Cluster)
 
 ```
-                        ┌──────────────┐
-                        │   Internet   │
-                        └──────┬───────┘
-                               │
-                        ┌──────▼───────┐
-                        │ Home Router  │
-                        │ 192.168.1.1  │
-                        │ DHCP Server  │
-                        └──────┬───────┘
-                               │ 1GbE
-                               │
-                    Port 1 ────┤
-              ┌────────────────┤ QNAP QSW-M2108-2C
-              │                │ 192.168.1.250 (static)
-              │                │
-    Port 2 ───┤                ├─── Port 3
-              │                │
-   ┌──────────▼─────┐   ┌─────▼──────────┐
-   │ Beelink S12 Pro│   │   KV260 FPGA   │
-   │ 192.168.1.10   │   │ 192.168.1.11   │
-   │                │   │                │
-   │ - Main dev PC  │   │ - ARM Linux    │
-   │ - CUDA (eGPU)  │   │ - FPGA fabric  │
-   │ - HPL host     │   │ - DMA accel    │
-   │ - SSH master   │   │ - SSH slave    │
-   └────────────────┘   └────────────────┘
-         │ PCIe (ADT-Link R3G)
-         │
-   ┌─────▼──────────┐
-   │  RTX 3060 12GB │
-   │  (eGPU)        │
-   │  External PSU  │
-   └────────────────┘
+          ┌──────────────────────┐
+          │  Internet (5Gbps)    │
+          │  ISP Fiber           │
+          └──────────┬───────────┘
+                     │
+              ┌──────▼──────┐
+              │  ONU/Modem  │  (XGS-PON)
+              └──────┬──────┘
+                     │ 10GbE (use Cat 6a → C1 for full speed)
+                     │
+   C1 ───────────────┤
+   ┌─────────────────┤ QNAP QSW-M2108-2C
+   │                 │ 192.168.1.10 (static)
+   │  Port 2 ────────┤
+   │       │         │
+   │  ┌────▼──────┐  │ Port 3 ──────┐  Port 4 ──────┐
+   │  │  Router   │  │              │                │
+   │  │192.168.1  │  │  ┌───────────▼──┐  ┌─────────▼──────┐
+   │  │  .254     │  │  │  KV260 FPGA  │  │ Beelink S12 Pro│
+   │  │ (DHCP/    │  │  │ 192.168.1.11 │  │ 192.168.1.12   │
+   │  │  WiFi)    │  │  │              │  │                │
+   │  └───────────┘  │  │ - ARM Linux  │  │ - Main dev PC  │
+   │                 │  │ - FPGA fabric│  │ - SSH master   │
+   │                 │  │ - DMA accel  │  │ - HPL host     │
+   │                 │  │ - SSH slave  │  └───────┬────────┘
+   │                 │  └──────────────┘          │ PCIe M.2
+   │                 │                       (ADT-Link R43SG)
+   └─────────────────┘                            │
+                                         ┌─────────▼──────┐
+                                         │  RTX 3060 12GB │
+                                         │  (eGPU)        │
+                                         │  External PSU  │
+                                         └────────────────┘
 ```
 
 > [!TIP]
@@ -472,27 +474,28 @@ The QSS dashboard shows at a glance:
 ## Setup Checklist
 
 ```
-[ ] 1. Unbox switch, connect power
-[ ] 2. Cable: Router → Port 1, Beelink → Port 2, KV260 → Port 3
-[ ] 3. Download Qfinder Pro → find switch IP
-[ ] 4. Login: admin / <MAC address ALL CAPS no colons>
-[ ] 5. Change admin password (forced on first login)
-[ ] 6. Update firmware (System > Firmware Update)
-[ ] 7. Set static IP for switch (e.g., 192.168.1.250)
-[ ] 8. Enable Flow Control on Port 2 and Port 3
-[ ] 9. Enable IGMP Snooping
-[ ] 10. Enable LLDP
-[ ] 11. Enable RSTP
-[ ] 12. Set static IPs on Beelink and KV260
-[ ] 13. Test connectivity:
-       - Beelink → ping router (192.168.1.1)           ✓
-       - Beelink → ping switch (192.168.1.250)          ✓
+[x] 1.  Unbox switch, connect power
+[x] 2.  Cables: ONU → Port 1, Router → Port 2, KV260 → Port 3, Beelink → Port 4
+[x] 3.  Found switch via browser (Qfinder Pro or direct IP)
+[x] 4.  Login: admin / <MAC address ALL CAPS no colons>
+[x] 5.  Changed admin password
+[x] 6.  Firmware updated (firmware: 1.2.3.1970981)
+[x] 7.  Static IP set → 192.168.1.10  (bookmark: http://192.168.1.10)
+[x] 8.  Flow Control enabled on Port 3 (KV260) and Port 4 (Beelink)
+[x] 9.  IGMP Snooping enabled
+[x] 10. LLDP enabled
+[x] 11. RSTP enabled
+[x] 12. ONU moved to Port 9 / C1 (10GbE combo RJ45) ✅ — full 5Gbps now unlocked
+[ ] 13. Set static IPs on Beelink and KV260 (via netplan)
+[ ] 14. Test connectivity:
+       - Beelink → ping router (192.168.1.254)          ✓
+       - Beelink → ping switch (192.168.1.10)           ✓
        - Beelink → ping KV260 (192.168.1.11)            ✓
-       - KV260 → ping Beelink (192.168.1.10)            ✓
-       - Beelink → ssh ubuntu@192.168.1.11               ✓
-       - Both → ping 8.8.8.8 (internet)                  ✓
-[ ] 14. Label physical ports with masking tape
-[ ] 15. Bookmark switch UI: http://192.168.1.250
+       - KV260  → ping Beelink (192.168.1.12)           ✓
+       - Beelink → ssh ubuntu@192.168.1.11              ✓
+       - Both   → ping 8.8.8.8 (internet)               ✓
+[ ] 15. Label physical ports with masking tape
+[ ] 16. Bookmark switch UI: http://192.168.1.10
 ```
 
 ---

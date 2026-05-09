@@ -435,7 +435,7 @@ The QSS dashboard shows at a glance:
    │  │  Router   │  │              │                │
    │  │192.168.1  │  │  ┌───────────▼──┐  ┌─────────▼──────┐
    │  │  .254     │  │  │  KV260 FPGA  │  │ Beelink S12 Pro│
-   │  │ (DHCP/    │  │  │ 192.168.1.11 │  │ 192.168.1.12   │
+   │  │ (DHCP/    │  │  │ 192.168.1.24 │  │ 192.168.1.12   │
    │  │  WiFi)    │  │  │              │  │                │
    │  └───────────┘  │  │ - ARM Linux  │  │ - Main dev PC  │
    │                 │  │ - FPGA fabric│  │ - SSH master   │
@@ -490,9 +490,9 @@ The QSS dashboard shows at a glance:
 [ ] 14. Test connectivity:
        - Beelink → ping router (192.168.1.254)          ✓
        - Beelink → ping switch (192.168.1.10)           ✓
-       - Beelink → ping KV260 (192.168.1.11)            ✓
-       - KV260  → ping Beelink (192.168.1.12)           ✓
-       - Beelink → ssh ubuntu@192.168.1.11              ✓
+       - Beelink → ping KV260 (192.168.1.24)            ✓
+       - KV260  → ping Beelink (TBD — set static IP)     ✓
+       - Beelink → ssh ubuntu@192.168.1.24              ✓
        - Both   → ping 8.8.8.8 (internet)               ✓
 [ ] 15. Label physical ports with masking tape
 [ ] 16. Bookmark switch UI: http://192.168.1.10

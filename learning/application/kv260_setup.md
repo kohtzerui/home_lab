@@ -12,7 +12,7 @@
 - MicroSD card (≥16GB, Class 10 or better)
 - 12V/3A power supply (comes in box)
 - Ethernet cable (to QNAP switch)
-- USB-A to USB-A cable (for JTAG/UART — PC ↔ KV260)
+- **Micro-USB cable** (for JTAG/UART serial console — PC ↔ KV260 Micro-USB port)
 - HDMI cable + monitor (optional, helpful initially)
 
 ### Software (PC)
@@ -27,10 +27,13 @@
 
 ### Step 1 — Flash SD Card with Ubuntu
 
-Download the official Ubuntu 22.04 image for Kria KV260:
+Download the official Ubuntu image for Kria KV260:
 - URL: https://ubuntu.com/download/amd
 - Look for **"Kria KV260 Vision AI Starter Kit"**
 - Flash the `.img.xz` directly with Balena Etcher (no need to extract)
+
+> [!NOTE]
+> The current image as of 2026 is **Ubuntu 24.04.2 LTS** (iot-limerick), not 22.04. The setup process is identical. The board will identify as `Ubuntu 24.04.2 LTS kria ttyPS1` on first boot.
 
 ### Step 2 — Physical Connections
 
@@ -46,13 +49,28 @@ First boot takes ~2 minutes.
 Open **PuTTY** with these settings:
 
 ```
-Port:     COM# (check Device Manager → Ports → "Silicon Labs CP210x")
+Connection type: Serial
+Port:     COM# — see note below
 Baud:     115200
 Data:     8 bits
 Parity:   None
 Stop:     1 bit
 Flow:     None
 ```
+
+**Finding the right COM port (FTDI dual-channel):**
+
+The KV260 uses an FTDI FT2232H chip that creates **two COM ports** in Device Manager:
+
+| COM port | FTDI Channel | Function |
+|---|---|---|
+| Lower number (e.g. COM4) | Channel B | **UART serial console** ← use this |
+| Higher number (e.g. COM5) | Channel C | JTAG |
+
+Check Device Manager → Ports (COM & LPT). Look for two **"USB Serial Port"** entries labelled **Manufacturer: FTDI**. Use the **lower** COM number for the serial console.
+
+> [!TIP]
+> If you see a blank screen after connecting, press **Enter** to wake the login prompt.
 
 Login:
 ```
@@ -75,6 +93,12 @@ sudo apt install -y build-essential git cmake python3-pip net-tools
 # Find IP address (for SSH going forward)
 ip addr show eth0
 ```
+
+The IP will be shown in the boot message as:
+```
+IPv4 address for eth0: 192.168.1.xx
+```
+Note this IP — you'll use it to SSH in from your PC going forward.
 
 ### Step 5 — SSH In (No More Serial Cable Needed)
 
@@ -159,6 +183,58 @@ Official instructions: https://docs.amd.com/r/en-US/ug1399-vitis-hls/Obtaining-a
 4. Submit → download `.lic` file (also emailed to you)
 5. In Vivado → Help → Manage Licenses → Load License → select `.lic` file
 6. Restart Vivado
+
+---
+
+## PS/PL Architecture — How Your Code Runs on KV260
+
+The KV260's Zynq UltraScale+ chip has two sides on the same die:
+
+```
+┌───────────────────────────────────────────────────┐
+│              Zynq UltraScale+ MPSoC               │
+│                                                   │
+│  ┌─────────────────┐  AXI DMA  ┌───────────────┐  │
+│  │  PS              │ ◄───────► │  PL           │  │
+│  │ (Processing      │           │ (Programmable │  │
+│  │  System)         │           │  Logic)       │  │
+│  │                  │           │               │  │
+│  │  ARM Cortex-A53  │           │  FPGA fabric  │  │
+│  │  Runs Linux      │           │  Your HLS C++ │  │
+│  │  Python / C++    │           │  accelerator  │  │
+│  │  host code       │           │  (bitstream)  │  │
+│  └──────────────────┘           └───────────────┘  │
+└───────────────────────────────────────────────────┘
+```
+
+| Side | Abbrev | What runs | What you write |
+|---|---|---|---|
+| Processing System | PS | ARM CPU, Linux, your host app | Python (Pynq) or C++ with XRT |
+| Programmable Logic | PL | FPGA fabric, your accelerator | C++ → Vitis HLS → bitstream |
+
+**The workflow:**
+1. Write HLS kernel in C++ → synthesize with Vitis HLS → produces bitstream
+2. Deploy bitstream to KV260 (programs the PL/FPGA fabric)
+3. Host code on ARM (Python or C++) loads bitstream, sends matrix data via AXI DMA, reads result
+
+---
+
+## Setup Progress Checklist
+
+```
+[x] 1.  Flash microSD with Ubuntu 24.04.2 LTS (iot-limerick image) via Balena Etcher
+[x] 2.  Insert SD card, connect Ethernet → switch Port 3, Micro-USB → PC, 12V power
+[x] 3.  First boot (~2 min) — connected via PuTTY serial (COM4, 115200 baud)
+[x] 4.  Changed default password (ubuntu → new password)
+[x] 5.  Board online — KV260 IP assigned via DHCP (check boot message or router)
+[ ] 6.  Run: sudo apt update && sudo apt upgrade -y
+[ ] 7.  Run: sudo hostnamectl set-hostname kv260
+[ ] 8.  Run: sudo apt install -y build-essential git cmake python3-pip net-tools
+[ ] 9.  Set static IP on KV260 via netplan
+[ ] 10. SSH in from PC: ssh ubuntu@<KV260_IP>
+[ ] 11. Set up passwordless SSH from Beelink → KV260
+[ ] 12. Follow EE4218 Lab sequence (Labs 1-4)
+```
 
 ---
 

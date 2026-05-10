@@ -74,6 +74,79 @@ sudo apt-mark unhold linux-image-* flash-kernel
 
 ---
 
+## [2026-05-10] Lesson 2: Pressing keys during GRUB boot drops you into the GRUB shell
+
+### What happened
+During Beelink boot, accidentally pressed keys (specifically `c`) while the GRUB boot menu
+was visible. This launched the GRUB command-line shell (`grub>`) instead of booting the OS.
+The screen showed a list of GRUB commands and a `grub>` prompt — looked like a crash.
+
+### Why it's hard to spot in advance
+The GRUB timeout screen looks like a normal boot splash. Pressing `c` is the keybind for
+"enter GRUB command line" — not obvious unless you know GRUB internals. Easy to trigger
+accidentally when mashing keys waiting for boot.
+
+### The fix
+Simple power cycle — the OS is fine, GRUB just entered interactive mode.
+```bash
+# From grub> prompt, if you want to exit without power cycling:
+normal
+# This returns to the normal GRUB boot menu
+```
+If `normal` doesn't work, just power cycle the machine.
+
+### General rule
+> **Don't touch the keyboard during the GRUB timeout window** (usually 3–5 seconds).
+> If you land in a `grub>` shell, type `normal` to return to the boot menu, or power cycle.
+
+### Cost of this mistake
+- ~2 minutes of confusion
+- No data loss
+
+---
+
+## [2026-05-10] Lesson 3: Ethernet interface (enp1s0) not auto-connecting after reboot on Rocky Linux 9
+
+### What happened
+After rebooting the Beelink (Rocky Linux 9.7), SSH timed out. On the physical screen,
+`ip addr show` showed `enp1s0` in state `UP` but with **no IP address** — DHCP had not
+run for that interface. The interface was detected but NetworkManager hadn't connected it.
+
+### Why it's hard to spot in advance
+`ip addr show` shows the interface as `UP` (cable is detected), which looks fine.
+The missing piece is that `UP` only means the link layer is active — it doesn't mean
+NetworkManager has configured the IP layer. The interface needs to be "connected" in
+NetworkManager's sense, which is a separate step.
+
+### The fix
+Manually trigger the connection for the current session:
+```bash
+sudo nmcli device connect enp1s0
+```
+
+Then make it permanent so it auto-connects on every boot:
+```bash
+sudo nmcli connection modify enp1s0 connection.autoconnect yes
+```
+
+Verify it's set:
+```bash
+nmcli connection show enp1s0 | grep autoconnect
+# connection.autoconnect: yes
+```
+
+### General rule
+> On Rocky Linux (and RHEL-based distros), always verify `connection.autoconnect yes`
+> for your primary ethernet interface after OS install. It may default to `no`.
+> After reboots, the IP may also change (DHCP) — check the physical screen or router DHCP
+> table to find the new IP if SSH fails.
+
+### Cost of this mistake
+- ~10 minutes debugging SSH timeout
+- Had to use physical screen to diagnose
+
+---
+
 ## Template for future entries
 
 ```

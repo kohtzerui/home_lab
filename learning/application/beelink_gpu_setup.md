@@ -235,6 +235,135 @@ nvcc -o cublas_dgemm cublas_dgemm_bench.cu -lcublas && ./cublas_dgemm
 
 ---
 
+## SGEMM Optimization Journey (2026-05-12)
+
+### Goal
+Build a hand-written CUDA SGEMM kernel from scratch, progressively optimizing it
+toward cuBLAS, to understand GPU memory hierarchy and tensor core usage.
+
+### Environment
+| | |
+|---|---|
+| GPU | RTX 3060 (SM_86 Ampere, 28 SMs, 12GB GDDR6) |
+| Driver | 595.71.05 |
+| CUDA | 13.2 |
+| Host | Beelink S12 Pro via ADT-Link eGPU |
+
+### Thermal validation (before benchmarking)
+```
+nvidia-smi dmon -s pcut -d 1 &
+while true; do ./sgemm_bench; done
+```
+Observations under sustained load:
+- **Power draw:** 137–142 W (81–84% of 170 W TDP) — no power throttle
+- **Temperature:** peaks at **70°C** (13°C headroom before 83°C throttle)
+- **SM clock:** 1807–1830 MHz — above the 1777 MHz boost spec
+- **Result:** eGPU chain fully healthy, fans confirmed working
+
+### Benchmark results — all sizes FP32 (GFLOPS)
+
+| M=N=K | Naive | Register | +cp.async | +WMMA | cuBLAS |
+|-------|------:|--------:|---------:|------:|-------:|
+| 512 | 785 | 1,812 | 2,208 | 1,248 | ~5,500 |
+| 1024 | 800 | 3,166 | 3,613 | **4,298** | ~7,400 |
+| 2048 | — | 4,374 | 4,781 | 4,108 | ~8,065 |
+| 4096 | — | 4,852 | 5,236 | **5,091** | ~8,100 |
+
+> [!NOTE]
+> RTX 3060 FP32 theoretical peak is ~12.74 TFLOPS. cuBLAS reaches ~64% of peak;
+> our best hand-written kernel reaches ~65% of cuBLAS (41% of peak).
+
+### Optimization techniques applied
+
+#### Level 0 — Naive (785 GFLOPS @ 4K)
+One thread per output element. Every MAC reads directly from global memory.
+Arithmetic intensity ≈ 2 FLOPs / 2 floats loaded — fully memory-bound.
+
+```cuda
+// Thread (row, col) computes one C element
+for (int k = 0; k < K; ++k)
+    acc += A[row*K+k] * B[k*N+col];   // two global loads per iteration
+```
+
+#### Level 1 — Register-tiled SGEMM (4,852 GFLOPS @ 4K — **6.2× speedup**)
+Thread block loads BM×BK (A) and BK×BN (B) tiles into shared memory.
+Each thread then computes a TM×TN = 8×8 register output tile.
+
+- Global memory traffic ↓ by factor BK (reuse across the tile)
+- FP32 FMAs operate purely on registers → maximum throughput
+- Block: 128×128 tile, 256 threads, BK=16
+
+```cuda
+// Each thread accumulates an 8×8 output block
+for (int k = 0; k < BK; ++k) {
+    for (int m = 0; m < TM; ++m) a_frag[m] = As[k][t_row*TM+m];
+    for (int n = 0; n < TN; ++n) b_frag[n] = Bs[k][t_col*TN+n];
+    for (int m = 0; m < TM; ++m)
+        for (int n = 0; n < TN; ++n)
+            acc[m][n] += a_frag[m] * b_frag[n];   // pure register ops
+}
+```
+
+#### Level 2 — cp.async double buffering (+5–22% over register kernel)
+Ampere's dedicated DMA engine copies GMEM→SMEM without stalling the warp.
+Ping-pong shared memory buffers let tile[k+1] load while tile[k] computes.
+
+```cuda
+// PTX intrinsics (no extra headers needed)
+void cp_async4(void* smem, const void* gmem);   // fire-and-forget copy
+void cp_async_commit();                          // seal this batch as a group
+void cp_async_wait<N>();                         // stall until ≤N groups in-flight
+
+// Pattern: issue next load, then wait for current, then compute
+issue_loads(strip+1, next_buf);   // DMA to other buffer
+cp_async_commit();
+cp_async_wait<1>();               // wait for strip, keep strip+1 flying
+__syncthreads();
+compute(curr_buf);                // FMAs run while DMA loads next strip
+```
+
+Gain is largest at small sizes (22% at 512) where load latency is proportionally
+higher. At 4K the FMA pipeline already hides some latency on its own.
+
+#### Level 3 — WMMA Tensor Cores (5,091 GFLOPS @ 4K)
+Ampere Tensor Cores execute a 16×16×16 FP16→FP32 matrix multiply per warp
+per clock — 8,192 FLOPs vs ~32 FLOPs for scalar FMAs. Inputs must be FP16;
+our kernel converts float→half during the shared memory load phase.
+
+```cuda
+// Warp-level, all 32 threads participate collectively
+fragment<matrix_a, 16,16,16, half, row_major> a_frag;
+fragment<matrix_b, 16,16,16, half, row_major> b_frag;
+fragment<accumulator, 16,16,16, float>         c_frag;
+
+load_matrix_sync(a_frag, &As[warp_row+m*16][k], BK);
+load_matrix_sync(b_frag, &Bs[k][warp_col+n*16], BN);
+mma_sync(c_frag, a_frag, b_frag, c_frag);   // 8192 FLOPs per warp
+```
+
+WMMA anomalies observed:
+- **512: slower than async** — tensor core warp sync overhead dominates small tiles
+- **2048: slightly slower than async** — 16 fp32 accumulator fragments per warp
+  (~128 registers) reduces occupancy, starving the pipeline
+
+### Remaining gap to cuBLAS
+cuBLAS combines ALL techniques simultaneously plus:
+- Larger tiles (256×128 or larger)
+- cp.async AND WMMA in the same kernel (our kernels use one or the other)
+- Shared memory padding to eliminate bank conflicts
+- FP16 inputs directly (no float→half conversion overhead per strip)
+- Hand-written SASS for sm_86 with architecture-specific instruction scheduling
+
+### Source files
+| File | Description |
+|------|-------------|
+| `~/sgemm_bench.cu` | cuBLAS SGEMM sweep across sizes |
+| `~/sgemm_kernels.cu` | Naive + register-tiled kernels vs cuBLAS |
+| `~/sgemm_async.cu` | Sync vs cp.async double-buffered kernel |
+| `~/sgemm_wmma.cu` | Tensor Core WMMA kernel vs cuBLAS |
+
+---
+
 ## Recommendations & Next Steps
 
 ### 1. Fix ethernet autoconnect (already done)
@@ -251,13 +380,14 @@ sudo dnf install -y terminus-fonts-console
 sudo systemctl restart systemd-vconsole-setup
 ```
 
-### 3. Write a custom CUDA DGEMM kernel
+### 3. Write a custom CUDA SGEMM kernel
 Follow the progression in `learning/theory/learning_cuda_gpu.md`:
 - **Phase 1** ✅ Done — setup, nvcc, nvidia-smi, CUDA hello world
-- **Phase 2** — Implement naive SGEMM (one thread per output element)
-- **Phase 3** — Tiled SGEMM with shared memory (target: 30–50% of cuBLAS)
-- **Phase 4** — Register-tiled SGEMM (target: 60–80% of cuBLAS)
-- **Phase 5** — Port to DGEMM (FP64)
+- **Phase 2** ✅ Done — Naive SGEMM (785 GFLOPS @ 4K)
+- **Phase 3** ✅ Done — Register-tiled SGEMM (4,852 GFLOPS @ 4K — 6.2× naive)
+- **Phase 4** ✅ Done — cp.async double buffering (5,236 GFLOPS) + WMMA tensor cores (5,091 GFLOPS)
+- **Phase 5** — Combine WMMA + cp.async in one kernel (target: 80–90% of cuBLAS)
+- **Phase 6** — Port to DGEMM (FP64) for HPL-equivalent benchmark
 
 ### 4. Cloud benchmark run (~$10–20)
 Once your custom kernel hits 60–80% of cuBLAS locally, rent an A100 on RunPod/Vast.ai

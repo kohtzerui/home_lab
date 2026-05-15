@@ -340,6 +340,145 @@ nmcli connection show enp1s0 | grep autoconnect
 
 ---
 
+## [2026-05-15] Lesson 4: Holding the running kernel version is not enough — apt can still install a new kernel
+
+### What happened
+After the Lesson 1 failure, the correct hold commands were run before `apt upgrade`:
+```bash
+sudo apt-mark hold linux-image-$(uname -r)   # expands to linux-image-6.8.0-1015-xilinx
+sudo apt-mark hold flash-kernel
+```
+Despite this, `apt upgrade` pulled in `linux-image-6.8.0-1029-xilinx` and `flash-kernel`
+ran its post-install trigger, writing a broken boot image — the exact same failure as Lesson 1.
+
+### Why it's hard to spot in advance
+`apt-mark hold linux-image-6.8.0-1015-xilinx` only prevents that **specific package** from
+being upgraded or removed. From apt's perspective, `linux-image-6.8.0-1029-xilinx` is a
+**brand new package** — not an upgrade of the held one — so apt installs it freely.
+The hold on `flash-kernel` prevents flash-kernel itself from being upgraded, but does NOT
+prevent flash-kernel from running as a dpkg **post-install trigger** when a new kernel is installed.
+This is a subtle but critical distinction.
+
+### The fix
+Hold the **meta-package** instead, which blocks all new xilinx kernel installs:
+```bash
+sudo apt-mark hold linux-image-xilinx   # blocks ANY new xilinx kernel package
+sudo apt-mark hold flash-kernel
+```
+Or use an exclude flag at upgrade time:
+```bash
+sudo apt upgrade --exclude='linux-image*' --exclude='flash-kernel' -y
+```
+
+### General rule
+> **Holding a specific kernel version is insufficient on Ubuntu.**
+> Always hold the meta-package (`linux-image-xilinx`) to prevent new kernel versions
+> from being installed as "new" packages. See Lesson 5 — the better answer is to
+> skip `apt upgrade` entirely on embedded boards.
+
+### Cost of this mistake
+- Filesystem corruption requiring fsck recovery from initramfs
+- ~1 hour of debugging and recovery
+- Password lost after reboot (forced reflash)
+
+---
+
+## [2026-05-15] Lesson 5: Never run `apt upgrade` on the KV260 — install only what you need
+
+### What happened
+Every `apt upgrade` attempt on the KV260 has caused a kernel-related failure:
+- Lesson 1: `apt upgrade` on a fresh image → broken DTB → SD card killed
+- Lesson 4: `apt upgrade` with holds → new kernel slipped through → filesystem corruption
+
+### Why it's hard to spot in advance
+The KV260 Ubuntu image is tightly coupled to specific kernel versions. Any kernel change
+risks breaking the boot chain. No amount of holds fully protects against apt's package
+dependency resolution pulling in new kernel variants.
+
+### The fix
+**Do not run `apt upgrade` on the KV260.** The correct workflow is:
+```bash
+# After first boot — run ONCE immediately after login:
+passwd                                       # change password first
+sudo apt-mark hold linux-image-$(uname -r)  # hold current kernel
+sudo apt-mark hold linux-image-xilinx        # hold meta-package
+sudo apt-mark hold flash-kernel              # hold bootloader tool
+
+# Safe package list refresh (never triggers installs):
+sudo apt update
+
+# Install ONLY what you specifically need, one at a time:
+sudo apt install <specific-package>
+
+# NEVER run:
+# sudo apt upgrade        ← will pull in new kernels
+# sudo apt full-upgrade   ← same risk
+# sudo apt dist-upgrade   ← same risk
+```
+
+### General rule
+> **On the KV260 (and all FPGA/embedded boards): `apt update` is safe, `apt upgrade` is not.**
+> Only install specific packages you actually need with `apt install <package>`.
+> The factory kernel works. Leave it alone.
+> This applies to: KV260, Raspberry Pi, Jetson, BeagleBone — any board where
+> the kernel is tightly coupled to hardware device trees and bootloaders.
+
+### Cost of this mistake
+- 2 failed KV260 setups in one session
+- ~2 hours of recovery time
+- Reinforced: the board doesn't need to be fully up-to-date to be useful
+
+---
+
+## [2026-05-15] Lesson 6: Consumer SD cards die quickly from boot loops — use High Endurance cards
+
+### What happened
+Two consecutive consumer-grade microSD cards (Samsung EVO Plus) were killed in separate
+sessions by the same failure pattern:
+1. `apt upgrade` triggered a broken kernel install → boot loop
+2. Repeated power cycles and recovery attempts during debugging
+3. Each failed boot wrote partial data to the card → EXT4 corruption accumulation
+4. Eventually the card became unreadable: Windows showed `D:\ - The directory name is invalid`
+   and Etcher reported `The writer process ended unexpectedly`
+
+The second card died even after fsck successfully repaired the filesystem — the accumulated
+write stress from the earlier session had already degraded it past recovery.
+
+### Why it's hard to spot in advance
+Consumer SD cards (even reputable ones like Samsung EVO Plus) are optimized for **read-heavy**
+workloads (cameras, phones). They have limited **write endurance** measured in TBW (terabytes
+written). A Linux board doing:
+- First-boot partition resize (large sequential writes)
+- Kernel install via apt (many small random writes)
+- Boot loops with incomplete writes from power cycles
+...can exceed a consumer card's write budget in a single session.
+
+### The fix
+Buy a **High Endurance** microSD card rated for continuous write workloads:
+
+| Card | Endurance | Notes |
+|------|-----------|-------|
+| Samsung PRO Endurance 32/64GB | 43,800 hours | Best value, widely available |
+| SanDisk MAX Endurance 32/64GB | 40,000 hours | Equivalent alternative |
+| Kingston Endurance 32/64GB | Similar | Budget option |
+
+These are designed for dashcams and security cameras — sustained write workloads — and
+cost only ~$10–15 more than consumer cards.
+
+Also: follow Lesson 5 (never run `apt upgrade`) to avoid the boot loops that stress the card
+in the first place.
+
+### General rule
+> **For any embedded Linux board used for development, always use a High Endurance microSD card.**
+> Consumer cards (EVO Plus, SanDisk Ultra) will die quickly under development write workloads.
+> The extra $10–15 is cheap insurance against losing a session's work and another card.
+
+### Cost of this mistake
+- 2 microSD cards killed (~$14 total)
+- ~3 hours of setup time lost across two sessions
+
+---
+
 ## Template for future entries
 
 ```

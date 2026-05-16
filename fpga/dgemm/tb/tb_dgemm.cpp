@@ -27,9 +27,9 @@
 #include "ap_fixed.h"
 
 // Matrix dimensions — small enough for fast C-sim
-#define M 32
-#define N 32
-#define K 32
+#define MAT_M 32
+#define MAT_N 32
+#define MAT_K 32
 
 // Types matching systolic_dgemm_v7.cpp
 typedef ap_fixed<27, 13, AP_TRN, AP_WRAP> weight_t;
@@ -108,43 +108,43 @@ int main() {
     srand(42);  // Fixed seed for reproducibility
 
     printf("=============================================================\n");
-    printf("  DGEMM Benchmark Testbench — %dx%d x %dx%d\n", M, K, K, N);
+    printf("  DGEMM Benchmark Testbench — %dx%d x %dx%d\n", MAT_M, MAT_K, MAT_K, MAT_N);
     printf("=============================================================\n\n");
 
     // -------------------------------------------------------------------------
     // Allocate buffers
     // -------------------------------------------------------------------------
-    static double   A_double[M*K], B_double[K*N];
-    static double   C_naive[M*N];
-    static double   C_golden[M*N];
+    static double   A_double[MAT_M*MAT_K], B_double[MAT_K*MAT_N];
+    static double   C_naive[MAT_M*MAT_N];
+    static double   C_golden[MAT_M*MAT_N];
 
-    static weight_t A_fixed[M*K];
-    static act_t    B_fixed[K*N];
-    static acc_t    C_v7[M*N];
+    static weight_t A_fixed[MAT_M*MAT_K];
+    static act_t    B_fixed[MAT_K*MAT_N];
+    static acc_t    C_v7[MAT_M*MAT_N];
 
     // -------------------------------------------------------------------------
     // Fill inputs with the SAME random values (converted to each type)
     // -------------------------------------------------------------------------
-    rand_fill_double(A_double, M, K);
-    rand_fill_double(B_double, K, N);
+    rand_fill_double(A_double, MAT_M, MAT_K);
+    rand_fill_double(B_double, MAT_K, MAT_N);
 
     // Copy into fixed-point arrays (ap_fixed truncates automatically)
-    for (int i = 0; i < M*K; i++) A_fixed[i] = A_double[i];
-    for (int i = 0; i < K*N; i++) B_fixed[i] = B_double[i];
+    for (int i = 0; i < MAT_M*MAT_K; i++) A_fixed[i] = A_double[i];
+    for (int i = 0; i < MAT_K*MAT_N; i++) B_fixed[i] = B_double[i];
 
     // Compute golden reference from the fixed-point VALUES (not double originals)
     // This ensures we compare v7 against what the actual inputs were after truncation
-    double A_ref[M*K], B_ref[K*N];
-    for (int i = 0; i < M*K; i++) A_ref[i] = (double)A_fixed[i];
-    for (int i = 0; i < K*N; i++) B_ref[i] = (double)B_fixed[i];
-    golden_dgemm(A_ref, B_ref, C_golden, M, N, K);
+    double A_ref[MAT_M*MAT_K], B_ref[MAT_K*MAT_N];
+    for (int i = 0; i < MAT_M*MAT_K; i++) A_ref[i] = (double)A_fixed[i];
+    for (int i = 0; i < MAT_K*MAT_N; i++) B_ref[i] = (double)B_fixed[i];
+    golden_dgemm(A_ref, B_ref, C_golden, MAT_M, MAT_N, MAT_K);
 
     // -------------------------------------------------------------------------
     // Run dgemm_naive (double, no optimisation)
     // -------------------------------------------------------------------------
     printf("Running dgemm_naive...\n");
     memset(C_naive, 0, sizeof(C_naive));
-    dgemm_naive(A_double, B_double, C_naive, M, N, K);
+    dgemm_naive(A_double, B_double, C_naive, MAT_M, MAT_N, MAT_K);
     printf("  Done.\n");
 
     // -------------------------------------------------------------------------
@@ -152,7 +152,7 @@ int main() {
     // -------------------------------------------------------------------------
     printf("Running systolic_dgemm_v7...\n");
     memset(C_v7, 0, sizeof(C_v7));
-    systolic_dgemm(A_fixed, B_fixed, C_v7, M, N, K);
+    systolic_dgemm(A_fixed, B_fixed, C_v7, MAT_M, MAT_N, MAT_K);
     printf("  Done.\n\n");
 
     // -------------------------------------------------------------------------
@@ -161,12 +161,12 @@ int main() {
     printf("--- Correctness Check ---\n");
 
     // Naive vs its own golden (should be near-zero, just floating-point rounding)
-    double golden_naive[M*N];
-    golden_dgemm(A_double, B_double, golden_naive, M, N, K);
-    double err_naive = check_result(golden_naive, C_naive, M*N, "naive vs golden_double:");
+    double golden_naive[MAT_M*MAT_N];
+    golden_dgemm(A_double, B_double, golden_naive, MAT_M, MAT_N, MAT_K);
+    double err_naive = check_result(golden_naive, C_naive, MAT_M*MAT_N, "naive vs golden_double:");
 
     // v7 vs fixed-point golden (error comes from fixed-point quantisation only)
-    double err_v7 = check_result_fixed(C_golden, C_v7, M*N, "v7 vs golden_fixed:");
+    double err_v7 = check_result_fixed(C_golden, C_v7, MAT_M*MAT_N, "v7 vs golden_fixed:");
 
     printf("\n");
 

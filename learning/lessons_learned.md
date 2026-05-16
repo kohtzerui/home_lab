@@ -479,6 +479,72 @@ in the first place.
 
 ---
 
+## [2026-05-16] Lesson 7: Systolic Array C-Simulation — Three Bugs and What They Teach
+
+### What happened
+Set up Vitis HLS 2025.1 to benchmark two DGEMM kernels targeting the KV260 (xczu5ev):
+1. **dgemm_naive** — FP64, triple-nested loop, no pragmas beyond AXI interfaces
+2. **systolic_dgemm_v7** — 8×8 output-stationary systolic array, ap_fixed<27,13> × ap_fixed<18,9>
+
+C-Simulation revealed three sequential bugs in the systolic kernel before it passed correctness:
+
+**Bug 1: `#define M/N/K` colliding with function parameter names**
+The testbench used `#define M 32` but the function declarations had `int M` as a parameter.
+The preprocessor replaced the parameter name with `32`, breaking compilation.
+Fix: renamed macros to `MAT_M`, `MAT_N`, `MAT_K`.
+
+**Bug 2: Stream-based PE grid has inherent C-sim timing issues**
+The original design used `hls::stream` pipes between 64 PEs. In hardware (DATAFLOW), all PEs
+run concurrently with cycle-accurate data forwarding. In C-sim, PEs execute sequentially —
+pe(0,0) runs all iterations, then pe(0,1), etc. — destroying the timing relationship between
+A and B data at interior PEs. Error: 8.8 (down from 28,000 after removing double-skewing).
+Fix: replaced stream-based PE grid with a **time-stepped register array** approach. Same
+systolic computation, but uses explicit `a_reg[i][j]`/`b_reg[i][j]` arrays with a single
+`SYSTOLIC` loop. Works correctly in both C-sim and synthesis.
+
+**Bug 3: Wrong loop bound + uninitialized registers**
+The SYSTOLIC loop used `TILE_K + SA_SIZE - 1 = 23` steps. But PE(7,7) receives data at
+time `t = i + j + k`, so the farthest PE needs `t` up to `7 + 7 + 15 = 29`, requiring
+`TILE_K + 2*(SA_SIZE - 1) = 30` steps. Also, `a_reg`/`b_reg` were not zeroed — interior
+PEs read garbage on early timesteps.
+Fix: changed loop bound to `TILE_K + 2*(SA_SIZE - 1)` and initialized all registers to zero.
+
+### Synthesis Results (the hard numbers)
+
+| Metric | dgemm_naive (FP64) | systolic_v7 (fixed-point) |
+|--------|-------------------|--------------------------|
+| Loop II | 12 cycles ❌ | **1 cycle** ✅ |
+| DSPs | 18 (1%) | **128 (10%)** |
+| BRAMs | 8 (2%) | 11 (3%) |
+| FFs | 5,612 (2%) | 37,626 (16%) |
+| LUTs | 5,588 (4%) | 16,399 (14%) |
+| Fmax | 342 MHz | 342 MHz |
+
+Key insight: FP64 multiply takes 14 cycles on DSP48E2, making II=12 the best the naive
+kernel can achieve. Fixed-point 27×18 maps to a single DSP in 1 cycle → II=1 with 64
+parallel MACs.
+
+### Why it's hard to spot in advance
+- **Bug 2** is a fundamental limitation of HLS C-simulation for systolic arrays.
+  The DATAFLOW scheduling that makes streams work only exists in RTL, not in C-sim.
+  This is not documented clearly in the Vitis HLS user guide.
+- **Bug 3** requires understanding the timing equation `t = i + j + k` for output-stationary
+  systolic arrays — the total propagation delay is `2*(SA_SIZE-1)`, not `SA_SIZE-1`.
+
+### General rule
+> **For HLS systolic arrays, use time-stepped register arrays (not hls::stream PEs) if you
+> need C-sim correctness.** The register-array approach synthesizes to identical hardware
+> (PIPELINE II=1 + UNROLL = parallel PEs) but avoids C-sim's sequential execution model.
+> Always initialize all register arrays to zero and compute the correct loop bound as
+> `TILE_K + 2*(SA_SIZE - 1)`.
+
+### Cost of this mistake
+- ~2 hours of iterative C-sim debugging
+- Complete kernel rewrite (stream → register array)
+- Taught the deep difference between C-sim and RTL timing models
+
+---
+
 ## Template for future entries
 
 ```

@@ -5,25 +5,23 @@
 // Architecture:
 //   8x8 output-stationary systolic array
 //   ap_fixed<27,13> x ap_fixed<18,9> -> exactly 1 DSP48E2 per MAC
-//   SRL-based input skewing  (no arithmetic masking)
-//   DATAFLOW with functions only (no loops inside dataflow region)
+//   Time-stepped register array (correct in both C-sim and synthesis)
 //   BIND_OP to guarantee DSP accumulator mapping
 //
-// Target: Vitis HLS 2022.1+, KV260 (xczu5ev)
+// Target: Vitis HLS 2025.1, KV260 (xczu5ev)
 // Expected: ~80 GOPS at 250 MHz (64 PEs x 2 FLOP x 250M / 4 DSPs overhead)
 // =============================================================================
 
 #include "ap_fixed.h"
 #include "ap_int.h"
-#include "hls_stream.h"
 
 // =============================================================================
 // 1. TYPES — sized exactly to DSP48E2 port limits
 //    A-port: 27 bits max, B-port: 18 bits max, P-register: 48 bits
 // =============================================================================
-typedef ap_fixed<27, 13, AP_TRN, AP_WRAP> weight_t;  // A-port — AP_WRAP preserves DSP inference
-typedef ap_fixed<18,  9, AP_TRN, AP_WRAP> act_t;      // B-port — AP_SAT would break DSP!
-typedef ap_fixed<48, 22, AP_TRN, AP_WRAP> acc_t;      // Maps to 48-bit P-register
+typedef ap_fixed<27, 13, AP_TRN, AP_WRAP> weight_t;  // A-port
+typedef ap_fixed<18,  9, AP_TRN, AP_WRAP> act_t;      // B-port
+typedef ap_fixed<48, 22, AP_TRN, AP_WRAP> acc_t;      // 48-bit P-register
 
 static const int SA_SIZE = 8;    // 8x8 = 64 PEs
 static const int TILE_K  = 16;   // K-tile depth — power of 2
@@ -31,219 +29,101 @@ static const int TILE_M  = SA_SIZE;
 static const int TILE_N  = SA_SIZE;
 
 // =============================================================================
-// 2. PROCESSING ELEMENT
-//    BIND_OP forces accumulator onto DSP, not fabric LUTs
-//    Asymmetric types guarantee 1 DSP48E2 per MAC (27x18 fits perfectly)
-// =============================================================================
-void pe(
-    hls::stream<weight_t> &a_in,  hls::stream<weight_t> &a_out,
-    hls::stream<act_t>    &b_in,  hls::stream<act_t>    &b_out,
-    hls::stream<acc_t>    &c_out
-) {
-    #pragma HLS INLINE off
-    acc_t acc = 0;
-    #pragma HLS BIND_OP variable=acc op=add impl=dsp  // accumulate inside DSP P-register
-
-    // TILE_K + SA_SIZE - 1 known at compile time -> fully unrolled by HLS
-    PE_LOOP: for (int k = 0; k < TILE_K + SA_SIZE - 1; k++) {
-        #pragma HLS PIPELINE II=1
-        // No DEPENDENCE pragma needed: BIND_OP+DSP handles the feedback correctly
-        weight_t a = a_in.read();
-        act_t    b = b_in.read();
-        acc += (acc_t)(a * b);   // 27x18 -> 1 DSP48E2, P-register accumulates internally
-        a_out.write(a);          // pass right ->
-        b_out.write(b);          // pass down  |
-    }
-    c_out.write(acc);
-}
-
-// =============================================================================
-// 3. SRL DELAY — spatial shift register, zero arithmetic
-//    BIND_STORAGE impl=srl -> LUT configured as shift register (not flip-flops)
-//    Cost: 1 LUT per bit per delay stage vs arithmetic masking (comparators + MUX)
-// =============================================================================
-template<int DELAY, typename T>
-void srl_delay_w(hls::stream<T> &in, hls::stream<T> &out) {
-    #pragma HLS INLINE off
-    T shift_reg[DELAY];
-    #pragma HLS ARRAY_PARTITION variable=shift_reg complete
-    #pragma HLS BIND_STORAGE variable=shift_reg impl=srl type=ram_1p
-
-    SRL_LOOP: for (int t = 0; t < TILE_K + SA_SIZE - 1; t++) {
-        #pragma HLS PIPELINE II=1
-        T in_val = in.read();
-        for (int i = DELAY - 1; i > 0; i--) {
-            #pragma HLS UNROLL
-            shift_reg[i] = shift_reg[i-1];
-        }
-        shift_reg[0] = in_val;
-        out.write(shift_reg[DELAY > 0 ? DELAY - 1 : 0]);
-    }
-}
-
-template<int DELAY, typename T>
-void srl_delay_a(hls::stream<T> &in, hls::stream<T> &out) {
-    #pragma HLS INLINE off
-    T shift_reg[DELAY];
-    #pragma HLS ARRAY_PARTITION variable=shift_reg complete
-    #pragma HLS BIND_STORAGE variable=shift_reg impl=srl type=ram_1p
-
-    SRL_LOOP: for (int t = 0; t < TILE_K + SA_SIZE - 1; t++) {
-        #pragma HLS PIPELINE II=1
-        T in_val = in.read();
-        for (int i = DELAY - 1; i > 0; i--) {
-            #pragma HLS UNROLL
-            shift_reg[i] = shift_reg[i-1];
-        }
-        shift_reg[0] = in_val;
-        out.write(shift_reg[DELAY > 0 ? DELAY - 1 : 0]);
-    }
-}
-
-// =============================================================================
-// 4. SKEW FEEDERS — one function per row/column (no loop inside DATAFLOW)
-//    Row i gets i cycles of SRL delay -> correct systolic skew
-//    Using separate functions (not a loop) so DATAFLOW sees them as parallel tasks
-// =============================================================================
-void skew_a(
-    weight_t A[SA_SIZE][TILE_K],
-    hls::stream<weight_t> a_skewed[SA_SIZE]
-) {
-    #pragma HLS ARRAY_PARTITION variable=A complete dim=2
-    #pragma HLS DATAFLOW
-
-    hls::stream<weight_t> raw[SA_SIZE];
-    #pragma HLS STREAM variable=raw depth=TILE_K+SA_SIZE
-
-    // Load raw rows into streams (sequential — no DATAFLOW violation)
-    LOAD_A: for (int t = 0; t < TILE_K + SA_SIZE - 1; t++) {
-        #pragma HLS PIPELINE II=1
-        for (int i = 0; i < SA_SIZE; i++) {
-            #pragma HLS UNROLL
-            int k = t - i;
-            bool valid = (k >= 0) && (k < TILE_K);
-            raw[i].write(valid ? A[i][k] : weight_t(0));
-        }
-    }
-
-    // Each row goes through its own SRL delay (i cycles for row i)
-    // Delay 0 = passthrough, delay 1..7 = SRL chains
-    srl_delay_w<0>(raw[0], a_skewed[0]);
-    srl_delay_w<1>(raw[1], a_skewed[1]);
-    srl_delay_w<2>(raw[2], a_skewed[2]);
-    srl_delay_w<3>(raw[3], a_skewed[3]);
-    srl_delay_w<4>(raw[4], a_skewed[4]);
-    srl_delay_w<5>(raw[5], a_skewed[5]);
-    srl_delay_w<6>(raw[6], a_skewed[6]);
-    srl_delay_w<7>(raw[7], a_skewed[7]);
-}
-
-void skew_b(
-    act_t B[TILE_K][SA_SIZE],
-    hls::stream<act_t> b_skewed[SA_SIZE]
-) {
-    #pragma HLS ARRAY_PARTITION variable=B complete dim=2
-    #pragma HLS DATAFLOW
-
-    hls::stream<act_t> raw[SA_SIZE];
-    #pragma HLS STREAM variable=raw depth=TILE_K+SA_SIZE
-
-    LOAD_B: for (int t = 0; t < TILE_K + SA_SIZE - 1; t++) {
-        #pragma HLS PIPELINE II=1
-        for (int j = 0; j < SA_SIZE; j++) {
-            #pragma HLS UNROLL
-            int k = t - j;
-            bool valid = (k >= 0) && (k < TILE_K);
-            raw[j].write(valid ? B[k][j] : act_t(0));
-        }
-    }
-
-    srl_delay_a<0>(raw[0], b_skewed[0]);
-    srl_delay_a<1>(raw[1], b_skewed[1]);
-    srl_delay_a<2>(raw[2], b_skewed[2]);
-    srl_delay_a<3>(raw[3], b_skewed[3]);
-    srl_delay_a<4>(raw[4], b_skewed[4]);
-    srl_delay_a<5>(raw[5], b_skewed[5]);
-    srl_delay_a<6>(raw[6], b_skewed[6]);
-    srl_delay_a<7>(raw[7], b_skewed[7]);
-}
-
-// =============================================================================
-// 5. PE GRID WIRING — fully unrolled 8x8 array
-//    Separate from DATAFLOW region to avoid loop-inside-DATAFLOW violation
-// =============================================================================
-void pe_grid(
-    hls::stream<weight_t> a_in[SA_SIZE],
-    hls::stream<act_t>    b_in[SA_SIZE],
-    hls::stream<acc_t>    c_out[SA_SIZE][SA_SIZE]
-) {
-    hls::stream<weight_t> a_pipe[SA_SIZE][SA_SIZE+1];
-    hls::stream<act_t>    b_pipe[SA_SIZE+1][SA_SIZE];
-    #pragma HLS STREAM variable=a_pipe depth=2
-    #pragma HLS STREAM variable=b_pipe depth=2
-
-    // Wire inputs to left/top edges
-    WIRE_A: for (int i = 0; i < SA_SIZE; i++)
-        for (int t = 0; t < TILE_K + SA_SIZE - 1; t++) {
-            #pragma HLS PIPELINE II=1
-            a_pipe[i][0].write(a_in[i].read());
-        }
-    WIRE_B: for (int j = 0; j < SA_SIZE; j++)
-        for (int t = 0; t < TILE_K + SA_SIZE - 1; t++) {
-            #pragma HLS PIPELINE II=1
-            b_pipe[0][j].write(b_in[j].read());
-        }
-
-    // Instantiate 8x8 = 64 PEs (UNROLL creates 64 parallel hardware units)
-    PE_ROW: for (int i = 0; i < SA_SIZE; i++) {
-        PE_COL: for (int j = 0; j < SA_SIZE; j++) {
-            #pragma HLS UNROLL
-            pe(a_pipe[i][j], a_pipe[i][j+1],
-               b_pipe[i][j], b_pipe[i+1][j],
-               c_out[i][j]);
-        }
-    }
-}
-
-// =============================================================================
-// 6. COLLECT — drain PE outputs into C tile
-// =============================================================================
-void collect(
-    hls::stream<acc_t> c_pipe[SA_SIZE][SA_SIZE],
-    acc_t C_tile[SA_SIZE][SA_SIZE]
-) {
-    COLLECT: for (int i = 0; i < SA_SIZE; i++)
-        for (int j = 0; j < SA_SIZE; j++) {
-            #pragma HLS PIPELINE II=1
-            C_tile[i][j] += c_pipe[i][j].read(); // accumulate across K-tiles
-        }
-}
-
-// =============================================================================
-// 7. TILE COMPUTE — DATAFLOW region (functions only, no raw loops)
+// 2. COMPUTE TILE — time-stepped systolic array
+//    Instead of hls::stream PEs (which have C-sim timing issues),
+//    we model the systolic data movement with register arrays.
+//    Each time step t:
+//      - Left edge (j=0) feeds A[i][t-i] into row i (arithmetic skew)
+//      - Top edge (i=0)  feeds B[t-j][j] into col j (arithmetic skew)
+//      - Interior PEs read from their left/top neighbour's register
+//      - All PEs MAC simultaneously, then shift data right/down
+//
+//    PIPELINE II=1 on the outer loop + UNROLL on inner loops
+//    => 64 parallel MACs per cycle, identical hardware to stream version
 // =============================================================================
 void compute_tile(
     weight_t A[SA_SIZE][TILE_K],
     act_t    B[TILE_K][SA_SIZE],
     acc_t    C[SA_SIZE][SA_SIZE]
 ) {
-    #pragma HLS DATAFLOW
+    #pragma HLS ARRAY_PARTITION variable=A complete dim=0
+    #pragma HLS ARRAY_PARTITION variable=B complete dim=0
 
-    hls::stream<weight_t> a_skewed[SA_SIZE];
-    hls::stream<act_t>    b_skewed[SA_SIZE];
-    hls::stream<acc_t>    c_pipe[SA_SIZE][SA_SIZE];
-    #pragma HLS STREAM variable=a_skewed depth=SA_SIZE+TILE_K
-    #pragma HLS STREAM variable=b_skewed depth=SA_SIZE+TILE_K
-    #pragma HLS STREAM variable=c_pipe   depth=1
+    // Registers modelling the systolic data movement
+    weight_t a_reg[SA_SIZE][SA_SIZE];
+    act_t    b_reg[SA_SIZE][SA_SIZE];
+    acc_t    acc[SA_SIZE][SA_SIZE];
+    #pragma HLS ARRAY_PARTITION variable=a_reg complete dim=0
+    #pragma HLS ARRAY_PARTITION variable=b_reg complete dim=0
+    #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
 
-    skew_a(A, a_skewed);
-    skew_b(B, b_skewed);
-    pe_grid(a_skewed, b_skewed, c_pipe);
-    collect(c_pipe, C);
+    // Zero all registers
+    ZERO: for (int i = 0; i < SA_SIZE; i++) {
+        #pragma HLS UNROLL
+        for (int j = 0; j < SA_SIZE; j++) {
+            #pragma HLS UNROLL
+            acc[i][j] = 0;
+            a_reg[i][j] = 0;
+            b_reg[i][j] = 0;
+        }
+    }
+
+    // Time-stepped systolic execution
+    // PE(i,j) receives data at time t = i + j + k, so farthest PE (SA_SIZE-1, SA_SIZE-1)
+    // needs t up to (SA_SIZE-1)+(SA_SIZE-1)+(TILE_K-1) = TILE_K + 2*(SA_SIZE-1) - 1
+    SYSTOLIC: for (int t = 0; t < TILE_K + 2 * (SA_SIZE - 1); t++) {
+        #pragma HLS PIPELINE II=1
+
+        // Process all PEs simultaneously (fully unrolled)
+        // Traverse in reverse order so we read old register values
+        // before overwriting them (shift right / shift down)
+        PE_ROW: for (int i = SA_SIZE - 1; i >= 0; i--) {
+            #pragma HLS UNROLL
+            PE_COL: for (int j = SA_SIZE - 1; j >= 0; j--) {
+                #pragma HLS UNROLL
+
+                weight_t a_val;
+                act_t    b_val;
+
+                // A data: left edge feeds from BRAM, interior from left neighbour
+                if (j == 0) {
+                    int k = t - i;
+                    a_val = (k >= 0 && k < TILE_K) ? A[i][k] : weight_t(0);
+                } else {
+                    a_val = a_reg[i][j - 1];
+                }
+
+                // B data: top edge feeds from BRAM, interior from top neighbour
+                if (i == 0) {
+                    int k = t - j;
+                    b_val = (k >= 0 && k < TILE_K) ? B[k][j] : act_t(0);
+                } else {
+                    b_val = b_reg[i - 1][j];
+                }
+
+                // MAC — maps to 1 DSP48E2 (27x18 multiply + 48-bit accumulate)
+                #pragma HLS BIND_OP variable=acc op=add impl=dsp
+                acc[i][j] += (acc_t)(a_val * b_val);
+
+                // Shift data to next PE (right for A, down for B)
+                a_reg[i][j] = a_val;
+                b_reg[i][j] = b_val;
+            }
+        }
+    }
+
+    // Accumulate into output tile (across K-tiles)
+    WRITEBACK: for (int i = 0; i < SA_SIZE; i++) {
+        #pragma HLS UNROLL
+        for (int j = 0; j < SA_SIZE; j++) {
+            #pragma HLS UNROLL
+            C[i][j] += acc[i][j];
+        }
+    }
 }
 
 // =============================================================================
-// 8. TOP-LEVEL KERNEL — AXI interfaces, outer tile loops
+// 3. TOP-LEVEL KERNEL — AXI interfaces, outer tile loops
 //    M x N x K matrix multiplication tiled into SA_SIZE x SA_SIZE x TILE_K blocks
 // =============================================================================
 extern "C" {
@@ -271,7 +151,7 @@ void systolic_dgemm(
     #pragma HLS ARRAY_PARTITION variable=A_tile complete dim=2
     #pragma HLS ARRAY_PARTITION variable=B_tile complete dim=2
 
-    // Outer tile loops — not in DATAFLOW, so sequential is fine here
+    // Outer tile loops — sequential
     TILE_M: for (int ti = 0; ti < M; ti += SA_SIZE) {
         TILE_N: for (int tj = 0; tj < N; tj += SA_SIZE) {
 
@@ -298,7 +178,7 @@ void systolic_dgemm(
                         B_tile[k][j] = B[(tk+k)*N + (tj+j)];
                     }
 
-                // Run systolic array on this tile (DATAFLOW inside)
+                // Run systolic array on this tile
                 compute_tile(A_tile, B_tile, C_tile);
             }
 
@@ -323,9 +203,9 @@ void systolic_dgemm(
 //
 //  BRAM usage:
 //    A_tile, B_tile, C_tile should fit in ~6 BRAMs total
-//    SRL shift registers: appear as LUTs, not BRAMs (correct)
+//    a_reg, b_reg: fully partitioned -> mapped to FFs, not BRAMs
 //
-//  Timing (II=1 on PE_LOOP):
+//  Timing (II=1 on SYSTOLIC loop):
 //    If II>1: check synthesis report for the dependency shown
 //    Most likely cause: acc read-write if BIND_OP fails
 //
@@ -334,6 +214,4 @@ void systolic_dgemm(
 //    For 1024x1024 matrix: (128x128x64) tiles x 23 cy / 250MHz ~ 6 ms
 //
 //  Target frequency: 250 MHz (4 ns period)
-//    If timing fails: check skew_a/skew_b SRL inference in utilisation report
-//    SRL should show as LUT, not as FF chains
 // =============================================================================

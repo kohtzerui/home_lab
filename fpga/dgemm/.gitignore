@@ -1,0 +1,15 @@
+# Vitis HLS — ignore everything inside component work dirs except configs
+dgemm_naive/dgemm_naive/
+hls_component/systolic_dgemm/
+_ide/
+
+# Vitis IDE metadata
+vitis-comp.json
+*.log
+
+# Keep:
+#   src/           — design source files
+#   tb/            — testbench
+#   dgemm_naive/hls_config.cfg
+#   hls_component/systolic_v7.cfg
+#   systolic_v7/hls_config.cfg

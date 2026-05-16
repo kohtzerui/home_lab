@@ -1,11 +1,17 @@
-# Vitis HLS — ignore everything inside component work dirs except configs
+# Vitis HLS — ignore build/work directories
 dgemm_naive/dgemm_naive/
 hls_component/systolic_dgemm/
 _ide/
 
-# Vitis IDE metadata
+# Vitis IDE auto-generated metadata
 vitis-comp.json
+compile_commands.json
+dfx_runtime.txt
 *.log
+
+# Sub-directory .gitignore files auto-created by Vitis
+dgemm_naive/.gitignore
+hls_component/.gitignore
 
 # Keep:
 #   src/           — design source files

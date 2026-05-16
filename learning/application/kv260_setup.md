@@ -81,13 +81,22 @@ Password: ubuntu  ← forced to change on first login
 ### Step 4 — Basic Linux Setup on KV260
 
 ```bash
-# Update packages
-sudo apt update && sudo apt upgrade -y
+# FIRST: change default password immediately
+passwd
+
+# SECOND: hold kernel packages — NEVER skip this (see lessons_learned.md #1, #4, #5, #6)
+sudo apt-mark hold linux-image-$(uname -r)
+sudo apt-mark hold linux-image-xilinx
+sudo apt-mark hold flash-kernel
+apt-mark showhold   # verify all 3 are listed
+
+# ⚠️  NEVER run: sudo apt upgrade / apt full-upgrade / apt dist-upgrade
+# The factory image is stable. Upgrading has killed 2 SD cards. See lessons_learned.md.
 
 # Set hostname
 sudo hostnamectl set-hostname kv260
 
-# Install essentials
+# Install ONLY what you need (safe — individual packages only)
 sudo apt install -y build-essential git cmake python3-pip net-tools
 
 # Find IP address (for SSH going forward)
@@ -227,7 +236,7 @@ The KV260's Zynq UltraScale+ chip has two sides on the same die:
 [x] 3.  First boot (~2 min) — connected via PuTTY serial (COM4, 115200 baud)
 [x] 4.  Changed default password (ubuntu → new password)
 [x] 5.  Board online — KV260 IP assigned via DHCP (check boot message or router)
-[ ] 6.  Run: sudo apt update && sudo apt upgrade -y
+[ ] 6.  Hold kernel packages (apt-mark hold — see Step 4 above) — NEVER apt upgrade
 [ ] 7.  Run: sudo hostnamectl set-hostname kv260
 [ ] 8.  Run: sudo apt install -y build-essential git cmake python3-pip net-tools
 [ ] 9.  Set static IP on KV260 via netplan

@@ -232,17 +232,18 @@ The KV260's Zynq UltraScale+ chip has two sides on the same die:
 
 ```
 [x] 1.  Flash microSD with Ubuntu 24.04.2 LTS (iot-limerick image) via Balena Etcher
-[x] 2.  Insert SD card, connect Ethernet → switch Port 3, Micro-USB → PC, 12V power
-[x] 3.  First boot (~2 min) — connected via PuTTY serial (COM4, 115200 baud)
-[x] 4.  Changed default password (ubuntu → new password)
-[x] 5.  Board online — KV260 IP assigned via DHCP (check boot message or router)
-[ ] 6.  Hold kernel packages (apt-mark hold — see Step 4 above) — NEVER apt upgrade
-[ ] 7.  Run: sudo hostnamectl set-hostname kv260
-[ ] 8.  Run: sudo apt install -y build-essential git cmake python3-pip net-tools
-[ ] 9.  Set static IP on KV260 via netplan
-[ ] 10. SSH in from PC: ssh ubuntu@<KV260_IP>
+[x] 2.  Insert SD card, connect Ethernet → switch, 12V power
+[x] 3.  First boot — SSH'd in via Windows Terminal
+[x] 4.  Changed default password
+[x] 5.  Board online — IP confirmed
+[x] 6.  Kernel packages held (linux-image-6.8.0-1015-xilinx, linux-image-xilinx, flash-kernel)
+[x] 7.  Hostname set: kv260
+[x] 8.  Installed: build-essential git cmake python3-pip net-tools
+[x] 9.  Static IP set: 192.168.1.50 (permanent via nmcli)
+[x] 10. SSH working: ssh ubuntu@192.168.1.50
 [ ] 11. Set up passwordless SSH from Beelink → KV260
-[ ] 12. Follow EE4218 Lab sequence (Labs 1-4)
+[ ] 12. Install Vitis 2025.1 on PC (in progress — downloading)
+[ ] 13. Follow EE4218 Lab sequence (Labs 1-4)
 ```
 
 ---
